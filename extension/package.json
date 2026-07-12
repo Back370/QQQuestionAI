@@ -1,0 +1,59 @@
+{
+  "name": "qqquestion-ai",
+  "displayName": "QQQuestionAI",
+  "description": "コミット前に差分から5問出題し、コードの理解度を確認する学習支援AI。答えは教えず、ヒントだけを提示します。",
+  "version": "0.1.0",
+  "publisher": "qqquestion",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Education"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "qqquestion.startBackend",
+        "title": "QQQuestionAI: バックエンドを起動"
+      },
+      {
+        "command": "qqquestion.installHook",
+        "title": "QQQuestionAI: pre-commit フックをインストール"
+      }
+    ],
+    "configuration": {
+      "title": "QQQuestionAI",
+      "properties": {
+        "qqquestion.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "バックエンド起動に使う Python。空なら backend/.venv/bin/python → python3 の順で探す"
+        },
+        "qqquestion.port": {
+          "type": "number",
+          "default": 8756,
+          "description": "バックエンドのポート (QQQ_PORT)"
+        },
+        "qqquestion.fakeLlm": {
+          "type": "boolean",
+          "default": false,
+          "description": "APIキー不要のデモモード (QQQ_FAKE_LLM=1) で起動する"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

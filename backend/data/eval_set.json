@@ -1,0 +1,77 @@
+[
+  {
+    "question": {
+      "id": "q1",
+      "type": "prerequisite",
+      "text": "RNN（リカレントニューラルネットワーク）が、通常の全結合ニューラルネットワークと決定的に違う点は何ですか。「再帰結合」という語を使って説明してください。",
+      "code_snippet": null,
+      "model_answer": "隠れ層が再帰結合を持ち、前の時刻の隠れ状態を次の時刻の入力として使うことで系列の文脈を保持できる点。",
+      "accepted_points": ["再帰結合", "前の時刻の隠れ状態", "系列・文脈の保持"],
+      "rubric": "再帰結合と前時刻状態の利用の両方に言及すれば correct、片方なら partial。",
+      "topic": "RNN",
+      "difficulty": 1
+    },
+    "answer": "隠れ層に再帰結合があり、前の時刻の隠れ状態を使って系列の文脈を保持できる点",
+    "expected": "correct"
+  },
+  {
+    "question": {
+      "id": "q1",
+      "type": "prerequisite",
+      "text": "RNN（リカレントニューラルネットワーク）が、通常の全結合ニューラルネットワークと決定的に違う点は何ですか。「再帰結合」という語を使って説明してください。",
+      "code_snippet": null,
+      "model_answer": "隠れ層が再帰結合を持ち、前の時刻の隠れ状態を次の時刻の入力として使うことで系列の文脈を保持できる点。",
+      "accepted_points": ["再帰結合", "前の時刻の隠れ状態", "系列・文脈の保持"],
+      "rubric": "再帰結合と前時刻状態の利用の両方に言及すれば correct、片方なら partial。",
+      "topic": "RNN",
+      "difficulty": 1
+    },
+    "answer": "再帰結合があるから",
+    "expected": "partial"
+  },
+  {
+    "question": {
+      "id": "q1",
+      "type": "prerequisite",
+      "text": "RNN（リカレントニューラルネットワーク）が、通常の全結合ニューラルネットワークと決定的に違う点は何ですか。「再帰結合」という語を使って説明してください。",
+      "code_snippet": null,
+      "model_answer": "隠れ層が再帰結合を持ち、前の時刻の隠れ状態を次の時刻の入力として使うことで系列の文脈を保持できる点。",
+      "accepted_points": ["再帰結合", "前の時刻の隠れ状態", "系列・文脈の保持"],
+      "rubric": "再帰結合と前時刻状態の利用の両方に言及すれば correct、片方なら partial。",
+      "topic": "RNN",
+      "difficulty": 1
+    },
+    "answer": "層が深いところが違います",
+    "expected": "incorrect"
+  },
+  {
+    "question": {
+      "id": "q4",
+      "type": "implementation",
+      "text": "逆伝播のループで、なぜ reversed（時刻の逆順）で回す必要があるのですか。",
+      "code_snippet": "for t in reversed(range(T)): ...",
+      "model_answer": "delta[:, t] の計算に未来の delta[:, t+1] が必要で、時刻tの誤差が未来の誤差に依存するため、T-1から過去へ順に計算する必要がある。",
+      "accepted_points": ["delta[t+1]への依存", "未来から過去への計算順序"],
+      "rubric": "t+1への依存関係が言えれば correct、「逆から回す」だけでは incorrect。",
+      "topic": "誤差逆伝播",
+      "difficulty": 3
+    },
+    "answer": "ｄｅｌｔａの t+1 への依存があり、未来から過去へ計算する必要があるから。",
+    "expected": "correct"
+  },
+  {
+    "question": {
+      "id": "q4",
+      "type": "implementation",
+      "text": "逆伝播のループで、なぜ reversed（時刻の逆順）で回す必要があるのですか。",
+      "code_snippet": "for t in reversed(range(T)): ...",
+      "model_answer": "delta[:, t] の計算に未来の delta[:, t+1] が必要で、時刻tの誤差が未来の誤差に依存するため、T-1から過去へ順に計算する必要がある。",
+      "accepted_points": ["delta[t+1]への依存", "未来から過去への計算順序"],
+      "rubric": "t+1への依存関係が言えれば correct、「逆から回す」だけでは incorrect。",
+      "topic": "誤差逆伝播",
+      "difficulty": 3
+    },
+    "answer": "そういう決まりだから",
+    "expected": "incorrect"
+  }
+]

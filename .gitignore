@@ -3,3 +3,18 @@
 .env
 .env.*
 .DS_Store
+
+# Python (backend)
+backend/.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+
+# 実行時データ（eval_set.json だけはリポジトリに含める）
+backend/data/*
+!backend/data/eval_set.json
+
+# VSCode 拡張
+extension/node_modules/
+extension/out/
+extension/*.vsix

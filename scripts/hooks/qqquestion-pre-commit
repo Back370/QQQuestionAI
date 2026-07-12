@@ -1,0 +1,55 @@
+#!/bin/sh
+# QQQuestionAI pre-commit フック（architecture.md §3 発動方法）。
+# QQQ_QUIZ=1 のとき（`git commit -q` ラッパー経由）だけ理解度チェックを発動する。
+# バックエンド未起動なら警告のみで素通しし、コミットを壊さない。
+# インストール: scripts/install_quiz_hook.sh を対象リポジトリで実行
+
+[ "$QQQ_QUIZ" = "1" ] || exit 0
+
+PORT="${QQQ_PORT:-8756}"
+BASE="http://127.0.0.1:${PORT}"
+
+if ! curl -s -m 2 "${BASE}/health" >/dev/null 2>&1; then
+    echo "QQQuestionAI: バックエンド未起動のため理解度チェックをスキップします" >&2
+    echo "  (VSCode で拡張を起動するか、backend/ で python -m qqquestion.server を実行)" >&2
+    exit 0
+fi
+
+echo "QQQuestionAI: 理解度チェックを開始します（VSCodeにクイズパネルが開きます）" >&2
+
+START_RESPONSE=$(curl -s -m 120 -X POST "${BASE}/quiz/start" \
+    -H "Content-Type: application/json" \
+    -d "{\"repo_path\": \"$(pwd)\"}")
+
+SESSION_ID=$(printf '%s' "$START_RESPONSE" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)
+
+if [ -z "$SESSION_ID" ]; then
+    echo "QQQuestionAI: セッションを開始できませんでした: $START_RESPONSE" >&2
+    echo "QQQuestionAI: チェックをスキップしてコミットを続行します" >&2
+    exit 0
+fi
+
+# クイズ完走(completed)まで待機。中断(aborted)ならコミット中止
+while :; do
+    STATUS=$(curl -s -m 5 "${BASE}/quiz/${SESSION_ID}/status" | python3 -c \
+        'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null)
+    case "$STATUS" in
+        completed)
+            curl -s -m 5 "${BASE}/quiz/${SESSION_ID}/report" | python3 -c \
+                'import json,sys; print(json.load(sys.stdin).get("rendered",""))' >&2
+            echo "QQQuestionAI: 理解度チェック完走。コミットを続行します" >&2
+            exit 0
+            ;;
+        aborted)
+            echo "QQQuestionAI: 理解度チェックが中断されました。コミットを中止します" >&2
+            echo "  (記録は保存済み。もう一度 git commit -q で再挑戦できます)" >&2
+            exit 1
+            ;;
+        "")
+            echo "QQQuestionAI: バックエンドとの接続が切れました。コミットを中止します" >&2
+            exit 1
+            ;;
+    esac
+    sleep 1
+done

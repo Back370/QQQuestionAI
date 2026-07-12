@@ -264,7 +264,7 @@ else:
 
 md_files = []
 for dirpath, dirnames, filenames in os.walk(ROOT):
-    dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", ".idea")]
+    dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", ".idea", ".venv")]
     md_files += [os.path.join(dirpath, f) for f in filenames if f.endswith(".md")]
 
 broken = []
