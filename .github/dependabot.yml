@@ -1,0 +1,10 @@
+# テンプレート自身の依存更新。現状の依存はGitHub Actionsのみ
+# （CIで使うactionのSHA固定を最新に追従させる）。
+# 派生プロジェクトでは、使うエコシステム（npm / pip 等）のエントリを追加すること
+# （雛形: .claude/skills/claude-project-setup/references/ci-workflow-examples.md）。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

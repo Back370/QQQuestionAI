@@ -1,0 +1,5 @@
+.idea/
+.claude/settings.local.json
+.env
+.env.*
+.DS_Store
