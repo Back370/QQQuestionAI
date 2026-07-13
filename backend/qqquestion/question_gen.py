@@ -9,8 +9,11 @@
 from __future__ import annotations
 
 import re
+from typing import Iterator
 
-from .llm import StructuredLLM
+from pydantic import ValidationError
+
+from .llm import StructuredLLM, stream_generate
 from .models import DiffContext, Question, QuestionSet
 
 PERSONA = (
@@ -83,31 +86,46 @@ def _rewrite_as_single_question(llm: StructuredLLM, question: Question) -> Quest
     )
 
 
-def _force_structure(questions: list[Question]) -> list[Question]:
-    """前提知識×2 → 実装×3 の並びと id (q1..q5) を強制する。"""
-    prerequisites = [q for q in questions if q.type == "prerequisite"]
-    implementations = [q for q in questions if q.type == "implementation"]
-
-    ordered = prerequisites[:2] + implementations[:3]
-    # 不足分は残り物から型を付け替えて充当する（LLM が構成を守らなかった場合の保険）
-    leftovers = prerequisites[2:] + implementations[3:]
-    while len(ordered) < 5 and leftovers:
-        filler = leftovers.pop(0)
-        needed_type = "prerequisite" if sum(
-            1 for q in ordered if q.type == "prerequisite"
-        ) < 2 else "implementation"
-        ordered.append(filler.model_copy(update={"type": needed_type}))
-    ordered.sort(key=lambda q: 0 if q.type == "prerequisite" else 1)
-
-    return [q.model_copy(update={"id": f"q{i + 1}"}) for i, q in enumerate(ordered)]
+# 5問構成: 前提知識×2 → 実装の説明×3（architecture.md §5.2 (a)）
+EXPECTED_TYPES = (
+    "prerequisite",
+    "prerequisite",
+    "implementation",
+    "implementation",
+    "implementation",
+)
+TOTAL_QUESTIONS = len(EXPECTED_TYPES)
 
 
-def generate_questions(
-    llm: StructuredLLM,
+def _fill_structure(start: int, leftovers: list[Question]) -> list[Question]:
+    """先頭 start 問が確定済みの前提で、残りスロットを型に合わせて埋める。
+
+    不足分は残り物の型を付け替えて充当する（LLM が構成を守らなかった場合の保険）。
+    """
+    prerequisites = [q for q in leftovers if q.type == "prerequisite"]
+    implementations = [q for q in leftovers if q.type == "implementation"]
+    filled: list[Question] = []
+    for slot, needed_type in enumerate(EXPECTED_TYPES[start:], start=start):
+        pool, other = (
+            (prerequisites, implementations)
+            if needed_type == "prerequisite"
+            else (implementations, prerequisites)
+        )
+        if pool:
+            question = pool.pop(0)
+        elif other:
+            question = other.pop(0).model_copy(update={"type": needed_type})
+        else:
+            break
+        filled.append(question.model_copy(update={"id": f"q{slot + 1}"}))
+    return filled
+
+
+def _build_user(
     diff_ctx: DiffContext,
-    weak_topics: list[str] | None = None,
-    difficulty_bias: dict[str, int] | None = None,
-) -> list[Question]:
+    weak_topics: list[str] | None,
+    difficulty_bias: dict[str, int] | None,
+) -> str:
     weak_note = ""
     if weak_topics:
         weak_note = (
@@ -119,18 +137,68 @@ def generate_questions(
         difficulty_note = "\nトピック別の推奨難易度: " + ", ".join(
             f"{topic}={level}" for topic, level in difficulty_bias.items()
         )
-
-    user = (
+    return (
         f"トピック候補: {', '.join(diff_ctx.topics) or '(差分から推定)'}"
         f"{weak_note}{difficulty_note}\n\n"
         f"コミット差分:\n```diff\n{diff_ctx.diff_text[:12000]}\n```"
     )
-    result = llm.generate(QuestionSet, _SYSTEM, user, temperature=0.4)
-    if len(result.questions) < 5:
-        raise ValueError(f"出題が5問未満です: {len(result.questions)}問")
-    questions = _force_structure(result.questions)
-    # 一問一答の強制: 複数の問いを束ねた問題は1問に絞って書き直させる
-    return [
-        _rewrite_as_single_question(llm, q) if is_multi_question(q.text) else q
-        for q in questions
-    ]
+
+
+def generate_questions_stream(
+    llm: StructuredLLM,
+    diff_ctx: DiffContext,
+    weak_topics: list[str] | None = None,
+    difficulty_bias: dict[str, int] | None = None,
+) -> Iterator[Question]:
+    """確定した問題から1問ずつ yield する（半二重ストリーミング）。
+
+    第1問が確定した時点で UI は出題を始められる。ストリーム途中では、
+    構成（前提2→実装3）と一問一答を満たす問題だけを先行して確定させる。
+    満たさない問題が現れたら先行確定を止め、残りは全問そろってから
+    従来どおり並べ替え・書き直しで補正する。
+    """
+    user = _build_user(diff_ctx, weak_topics, difficulty_bias)
+    published = 0
+    frozen = False  # 構成違反を見つけたら先行確定をやめて最終補正に回す
+    final_set: QuestionSet | None = None
+    for name, payload in stream_generate(llm, QuestionSet, _SYSTEM, user, temperature=0.4):
+        if name == "final":
+            final_set = payload  # type: ignore[assignment]
+            continue
+        if frozen or not isinstance(payload, dict):
+            continue
+        items = payload.get("questions")
+        if not isinstance(items, list):
+            continue
+        # 配列の最後の要素は生成途中の可能性があるため、その手前までを確定候補にする
+        for index in range(published, min(len(items) - 1, TOTAL_QUESTIONS)):
+            try:
+                question = Question.model_validate(items[index])
+            except ValidationError:
+                frozen = True
+                break
+            if question.type != EXPECTED_TYPES[index] or is_multi_question(question.text):
+                frozen = True
+                break
+            published += 1
+            yield question.model_copy(update={"id": f"q{published}"})
+    assert final_set is not None
+    if len(final_set.questions) < TOTAL_QUESTIONS:
+        raise ValueError(f"出題が5問未満です: {len(final_set.questions)}問")
+    # 部分パースで確定した問題は最終リストの先頭 published 件と同一
+    for question in _fill_structure(published, final_set.questions[published:]):
+        # 一問一答の強制: 複数の問いを束ねた問題は1問に絞って書き直させる
+        if is_multi_question(question.text):
+            question = _rewrite_as_single_question(llm, question)
+        yield question
+
+
+def generate_questions(
+    llm: StructuredLLM,
+    diff_ctx: DiffContext,
+    weak_topics: list[str] | None = None,
+    difficulty_bias: dict[str, int] | None = None,
+) -> list[Question]:
+    return list(
+        generate_questions_stream(llm, diff_ctx, weak_topics, difficulty_bias)
+    )

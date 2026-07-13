@@ -163,8 +163,6 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
         diff_ctx = deps.diff_provider(request.repo_path)
         if not diff_ctx.diff_text.strip():
             raise HTTPException(status_code=400, detail="ステージ済みの差分がありません")
-        if deps.kb_builder is not None:
-            deps.kb_builder.build_for_topics(diff_ctx.topics)
         learner_state = load_learner_state(deps.history_path)
         session = QuizSession(
             llm=deps.llm,
@@ -172,8 +170,16 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
             diff_ctx=diff_ctx,
             learner_state=learner_state,
             history_store=HistoryStore(deps.history_path),
+            defer_questions=True,
         )
+        # 生成前にセッションを公開する: 拡張の /quiz/pending ポーリングが即座に
+        # 拾ってパネルを開き、「生成中」を表示できる。出題は1問ずつ確定し、
+        # 第1問ができた時点でパネルに表示される
         deps.sessions[session.id] = session
+        session.prepare(fail_open=True)
+        # 知識ベース構築（Web検索）はヒント・解説にしか使わないため出題の後に回す
+        if deps.kb_builder is not None and session.status == "in_progress":
+            deps.kb_builder.build_for_topics(diff_ctx.topics)
         return {
             "session_id": session.id,
             "topics": diff_ctx.topics,
@@ -181,6 +187,7 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
             "kb_chunks": deps.kb.count(),
             "weak_topics": learner_state.weak_topics(),
             "total": session.total,
+            "error": session.error,
         }
 
     @app.get("/quiz/pending")
@@ -208,7 +215,12 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
     @app.get("/quiz/{session_id}/question")
     def question(session_id: str):
         session = _session_or_404(deps, session_id)
-        return {"question": session.current_public(), "status": session.status}
+        return {
+            "question": session.current_public(),
+            "status": session.status,
+            "preparing": session.preparing,
+            "error": session.error,
+        }
 
     @app.post("/quiz/{session_id}/answer")
     def answer(session_id: str, request: AnswerRequest):

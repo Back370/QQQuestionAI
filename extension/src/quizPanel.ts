@@ -5,10 +5,13 @@
 import * as vscode from "vscode";
 import { AnswerResponse, BackendClient, StreamEvent } from "./backendClient";
 
+const QUESTION_POLL_MS = 700;
+
 export class QuizPanel {
   private static panels = new Map<string, QuizPanel>();
   private readonly panel: vscode.WebviewPanel;
   private finished = false;
+  private disposed = false;
 
   static show(client: BackendClient, sessionId: string): void {
     if (QuizPanel.panels.has(sessionId)) {
@@ -34,6 +37,7 @@ export class QuizPanel {
 
     // パネルを閉じる = 明示的な中断 → コミット中止（architecture.md §3）
     this.panel.onDidDispose(async () => {
+      this.disposed = true;
       QuizPanel.panels.delete(this.sessionId);
       if (!this.finished) {
         try {
@@ -53,11 +57,24 @@ export class QuizPanel {
   }
 
   private async loadQuestion(): Promise<void> {
+    if (this.disposed || this.finished) {
+      return;
+    }
     try {
       const body = await this.client.question(this.sessionId);
       if (body.question) {
         this.post({ type: "question", question: body.question });
+      } else if (body.status === "in_progress") {
+        // 出題を生成中（または次の問題がまだ確定していない）→ できるまでポーリング
+        this.post({ type: "preparing" });
+        setTimeout(() => void this.loadQuestion(), QUESTION_POLL_MS);
       } else {
+        if (body.error) {
+          this.post({
+            type: "error",
+            message: "問題の生成に失敗したためチェックをスキップします: " + body.error,
+          });
+        }
         await this.completeSession();
       }
     } catch (error) {
@@ -152,6 +169,9 @@ export class QuizPanel {
     this.post({ type: "result", result });
     if (result.status === "completed") {
       void this.completeSession();
+    } else if (!result.next_question) {
+      // 次の問題がまだ生成中 → 確定するまでポーリングして表示する
+      void this.loadQuestion();
     }
   }
 
@@ -212,9 +232,9 @@ function renderHtml(): string {
     <pre id="code" style="display:none"></pre>
     <textarea id="answer" placeholder="記述式で解答してください"></textarea>
     <div>
-      <button id="submit">解答する</button>
-      <button id="hint" class="secondary">ヒント</button>
-      <button id="giveup" class="secondary">ギブアップ</button>
+      <button id="submit" disabled>解答する</button>
+      <button id="hint" class="secondary" disabled>ヒント</button>
+      <button id="giveup" class="secondary" disabled>ギブアップ</button>
       <button id="retry" class="secondary" style="display:none">再読み込み</button>
     </div>
   </div>
@@ -286,6 +306,7 @@ function renderHtml(): string {
     }
     el("answer").value = "";
     el("answer").focus();
+    setBusy(false);
   }
 
   window.addEventListener("message", (event) => {
@@ -293,6 +314,11 @@ function renderHtml(): string {
     if (message.type === "question") {
       el("retry").style.display = "none";
       showQuestion(message.question);
+    } else if (message.type === "preparing") {
+      // 出題を生成中（初回、または次の問題の確定待ち）
+      el("title").textContent = "問題を生成中…";
+      el("meta").textContent = "コミット差分からAIが出題を作成しています。少々お待ちください";
+      setBusy(true);
     } else if (message.type === "load_error") {
       el("title").textContent = "問題を読み込めませんでした";
       el("retry").style.display = "";
@@ -336,8 +362,10 @@ function renderHtml(): string {
       }
       if (result.next_question) {
         showQuestion(result.next_question);
+      } else if (result.status !== "completed") {
+        // 次の問題が生成中: preparing → question メッセージが後から届く
+        setBusy(true);
       }
-      setBusy(false);
     } else if (message.type === "hint") {
       let text = "先生(ヒント)> " + message.hint.hint;
       if (message.hint.citations.length) {

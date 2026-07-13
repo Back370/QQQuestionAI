@@ -108,7 +108,12 @@ export class BackendClient {
     return this.request("/quiz/pending");
   }
 
-  question(sessionId: string): Promise<{ question: PublicQuestion | null; status: string }> {
+  question(sessionId: string): Promise<{
+    question: PublicQuestion | null;
+    status: string;
+    preparing?: boolean;
+    error?: string | null;
+  }> {
     return this.request(`/quiz/${sessionId}/question`);
   }
 

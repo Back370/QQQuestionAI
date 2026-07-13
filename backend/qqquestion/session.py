@@ -25,7 +25,7 @@ from .models import (
     Judgement,
     Question,
 )
-from .question_gen import generate_questions
+from .question_gen import TOTAL_QUESTIONS, generate_questions_stream
 
 
 @dataclass
@@ -63,6 +63,7 @@ class QuizSession:
         learner_state: LearnerState | None = None,
         history_store: HistoryStore | None = None,
         session_id: str | None = None,
+        defer_questions: bool = False,
     ):
         self.id = session_id or uuid.uuid4().hex[:12]
         self._llm = llm
@@ -71,47 +72,80 @@ class QuizSession:
         self._learner = learner_state or LearnerState()
         self.diff_ctx = diff_ctx
         self.status = "in_progress"  # in_progress | completed | aborted
+        self.error: str | None = None  # 出題生成に失敗したときのメッセージ
 
-        questions = generate_questions(
-            llm,
-            diff_ctx,
-            weak_topics=self._learner.weak_topics(),
-            difficulty_bias=self._learner.difficulty_bias(),
-        )
-        self._states = [
-            QuestionState(
-                question=q,
-                interaction=Interaction(
-                    session_id=self.id,
-                    question_id=q.id,
-                    topic=q.topic,
-                    difficulty=q.difficulty,
-                    question_type=q.type,
-                ),
-                hint_level=self._learner.initial_hint_level(q.topic),
-            )
-            for q in questions
-        ]
+        self._states: list[QuestionState] = []
         self._index = 0
+        self._preparing = True
+        # defer_questions=True のときは呼び出し側が prepare() を実行する。
+        # セッションを先に UI へ公開してから出題を確定させるため（パネル即時表示）
+        if not defer_questions:
+            self.prepare()
+
+    def prepare(self, fail_open: bool = False) -> None:
+        """出題を1問ずつ確定させる。第1問の確定時点から UI は表示を始められる。
+
+        fail_open=True では生成失敗でも例外を投げず、確定済みの問題だけで
+        続行する（0問なら completed にしてコミットを通す＝従来のスキップ相当）。
+        """
+        try:
+            for question in generate_questions_stream(
+                self._llm,
+                self.diff_ctx,
+                weak_topics=self._learner.weak_topics(),
+                difficulty_bias=self._learner.difficulty_bias(),
+            ):
+                if self.status != "in_progress":
+                    return  # 準備中にパネルが閉じられた等
+                self._states.append(self._make_state(question))
+        except Exception as error:
+            if not fail_open:
+                raise
+            self.error = str(error)
+        finally:
+            self._preparing = False
+            if not self._states and self.status == "in_progress":
+                self.status = "completed"
+
+    def _make_state(self, question: Question) -> QuestionState:
+        return QuestionState(
+            question=question,
+            interaction=Interaction(
+                session_id=self.id,
+                question_id=question.id,
+                topic=question.topic,
+                difficulty=question.difficulty,
+                question_type=question.type,
+            ),
+            hint_level=self._learner.initial_hint_level(question.topic),
+        )
 
     # ---- 参照系 -------------------------------------------------------
 
     @property
+    def preparing(self) -> bool:
+        return self._preparing
+
+    @property
     def finished(self) -> bool:
-        return self._index >= len(self._states)
+        return not self._preparing and self._index >= len(self._states)
 
     @property
     def total(self) -> int:
+        if self._preparing:
+            return max(TOTAL_QUESTIONS, len(self._states))
         return len(self._states)
 
     def current(self) -> QuestionState:
-        if self.finished:
+        if self._index >= len(self._states):
+            if self._preparing:
+                raise IndexError("問題を準備中です")
             raise IndexError("全問終了しています")
         return self._states[self._index]
 
     def current_public(self) -> dict | None:
-        """UI に返す現在の問題（模範解答なし）。終了後は None。"""
-        if self.finished:
+        """UI に返す現在の問題（模範解答なし）。終了後・準備中は None。"""
+        if self._index >= len(self._states):
             return None
         state = self.current()
         view = state.question.public_view()
