@@ -11,8 +11,9 @@
 1. `backend/` で venv を作成し依存をインストールする（リポジトリの CLAUDE.md 参照）
 2. `backend/.env` に `GOOGLE_API_KEY` を設定する（`backend/env.example` をコピー）。
    API キーなしで試す場合は設定 `qqquestion.fakeLlm` を有効にする
-3. コマンド「QQQuestionAI: pre-commit フックをインストール」を対象リポジトリで実行し、
-   案内される `-q` 検知シェル関数を `~/.zshrc` に追記する
+3. コマンド「QQQuestionAI: pre-commit フックをインストール」を対象リポジトリで実行する
+   （pre-commit フックの導入と `-q` 検知シェル関数の `~/.zshrc` への追記まで自動で行われる。
+   反映に一度 `source ~/.zshrc` が必要）
 
 ## 使い方
 

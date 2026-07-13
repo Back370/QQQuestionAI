@@ -33,6 +33,8 @@ class QuestionState:
     interaction: Interaction
     hint_level: int
     done: bool = False
+    # 部分正解で満たした要点の蓄積。次の解答では残りの要点だけ埋まれば正解になる
+    matched_points: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -113,7 +115,10 @@ class QuizSession:
 
     def submit_answer(self, answer: str) -> AnswerResult:
         state = self.current()
-        judgement = judge_answer(self._llm, state.question, answer)
+        judgement = judge_answer(
+            self._llm, state.question, answer, already_matched=state.matched_points
+        )
+        state.matched_points = list(judgement.matched_points)
 
         state.interaction.attempts += 1
         if state.interaction.first_verdict is None:

@@ -85,6 +85,26 @@ def test_give_up_reveals_answer_and_moves_on(demo_llm, kb, diff_ctx, tmp_path):
     assert interaction.final_verdict == "incorrect"
 
 
+def test_partial_answers_accumulate_across_attempts(demo_llm, kb, diff_ctx, tmp_path):
+    """部分正解 → 足りなかった要素だけ答えれば正解になる（言い直し不要）。"""
+    session = _make_session(demo_llm, kb, diff_ctx, tmp_path)
+
+    # q1 の要点は「再帰結合」「前の時刻の隠れ状態」「系列・文脈の保持」の3つ
+    first = session.submit_answer("隠れ層が再帰結合を持つ点が違います")
+    assert first.judgement.verdict == "partial"
+    assert first.question_done is False
+
+    # 2回目は「再帰結合」に触れず、残り2要点だけを答える
+    second = session.submit_answer("前の時刻の隠れ状態を使って系列の文脈を保持できる")
+    assert second.judgement.verdict == "correct"
+    assert second.question_done is True
+
+    interaction = session.interactions()[0]
+    assert interaction.first_verdict == "partial"
+    assert interaction.final_verdict == "correct"
+    assert interaction.attempts == 2
+
+
 def test_hint_level_starts_at_2_for_weak_topic(demo_llm, kb, diff_ctx, tmp_path):
     history = [
         Interaction(session_id="old", question_id="q", topic="RNN",

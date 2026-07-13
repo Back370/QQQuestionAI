@@ -15,7 +15,8 @@ from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
 
-DEFAULT_MODEL = "gemini-2.0-flash"
+# gemini-2.0-flash は無料枠の割り当てが終了している(429 limit:0)ため 2.5 を既定にする
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 
 class StructuredLLM(Protocol):

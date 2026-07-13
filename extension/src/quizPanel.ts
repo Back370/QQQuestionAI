@@ -194,7 +194,8 @@ function renderHtml(): string {
       if (verdict === "correct") {
         addEntry("correct", "先生> 正解です！🎉 " + result.judgement.reason);
       } else if (verdict === "partial") {
-        addEntry("partial", "先生> 部分的に正解です。" + result.judgement.reason + " もう一度どうぞ。");
+        addEntry("partial", "先生> 部分的に正解です。" + result.judgement.reason
+          + " 正解済みの部分は繰り返さなくてよいので、足りない部分だけ補足してください。");
       } else if (result.question_done) {
         addEntry("incorrect", "正解は「" + (result.model_answer || "") + "」でした。");
       } else {

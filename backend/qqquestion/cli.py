@@ -112,7 +112,10 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
                 _print_explanation(result)
                 break
             if verdict == "partial":
-                print(f"先生> 部分的に正解です。{result.judgement.reason} もう一度どうぞ。")
+                print(
+                    f"先生> 部分的に正解です。{result.judgement.reason} "
+                    "正解済みの部分は繰り返さなくてよいので、足りない部分だけ補足してください。"
+                )
             else:
                 print("先生> 残念、違います。「ヒント」と言ってくれれば手がかりを出しますよ。")
         print()

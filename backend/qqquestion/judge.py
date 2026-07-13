@@ -3,9 +3,13 @@
 - 許容解答との正規化文字列一致で決まる場合は LLM を呼ばない
 - LLM 判定は temperature 0.0、採点基準（rubric / accepted_points）との
   照合として行い、判定理由を必須にする。理由が空なら1回だけ再判定
+- 部分正解の要点は attempt をまたいで持ち越す: 前回までに満たした要点
+  （already_matched）は再度の言及を要求せず、残りが埋まれば correct にする
 """
 
 from __future__ import annotations
+
+from typing import Sequence
 
 from .llm import StructuredLLM
 from .models import Judgement, Question
@@ -33,9 +37,64 @@ def _exact_match(question: Question, answer: str) -> bool:
     return any(normalize(candidate) == normalized_answer for candidate in candidates)
 
 
-def judge_answer(llm: StructuredLLM, question: Question, answer: str) -> Judgement:
+def _canonical_point(point: str, accepted_points: Sequence[str]) -> str | None:
+    """LLM が返した要点文字列を accepted_points の正規の1つに対応付ける。"""
+    normalized = normalize(point)
+    if not normalized:
+        return None
+    for accepted in accepted_points:
+        normalized_accepted = normalize(accepted)
+        if (
+            normalized == normalized_accepted
+            or normalized in normalized_accepted
+            or normalized_accepted in normalized
+        ):
+            return accepted
+    return None
+
+
+def _merge_with_previous(
+    question: Question, judgement: Judgement, already_matched: Sequence[str]
+) -> Judgement:
+    """前回までに満たした要点と合算し、verdict を決定的に再計算する。"""
+    matched: list[str] = []
+    for point in [*already_matched, *judgement.matched_points]:
+        canonical = _canonical_point(point, question.accepted_points)
+        if canonical is not None and canonical not in matched:
+            matched.append(canonical)
+    missing = [p for p in question.accepted_points if p not in matched]
+
+    if judgement.verdict == "correct" and not already_matched:
+        return judgement  # 単独で正解ならそのまま（合算で降格はさせない）
+    if not missing:
+        reason = judgement.reason
+        if already_matched:
+            reason = (reason + " 前回までの解答と合わせて全要点を満たしました。").strip()
+        return Judgement(
+            verdict="correct", matched_points=matched, missing_points=[], reason=reason
+        )
+    if matched:
+        return Judgement(
+            verdict="partial",
+            matched_points=matched,
+            missing_points=missing,
+            reason=judgement.reason,
+        )
+    return judgement
+
+
+def judge_answer(
+    llm: StructuredLLM,
+    question: Question,
+    answer: str,
+    already_matched: Sequence[str] = (),
+) -> Judgement:
     if not answer.strip():
-        return Judgement(verdict="incorrect", reason="解答が空です。")
+        return Judgement(
+            verdict="incorrect",
+            matched_points=list(already_matched),
+            reason="解答が空です。",
+        )
 
     if _exact_match(question, answer):
         return Judgement(
@@ -44,11 +103,19 @@ def judge_answer(llm: StructuredLLM, question: Question, answer: str) -> Judgeme
             reason="許容解答と一致",
         )
 
+    already_note = ""
+    if already_matched:
+        already_note = (
+            f"\n前回までの解答で既に満たした要点（今回の解答に含まれていなくてもよい。"
+            f"再度の言及を要求しないこと）: {list(already_matched)}\n"
+            "今回はまだ満たされていない要点だけを判定すること。"
+        )
     user = (
         f"問題: {question.text}\n"
         f"模範解答: {question.model_answer}\n"
         f"要点(accepted_points): {question.accepted_points}\n"
-        f"採点基準(rubric): {question.rubric}\n\n"
+        f"採点基準(rubric): {question.rubric}\n"
+        f"{already_note}\n"
         f"学習者の解答: {answer}"
     )
     judgement = llm.generate(Judgement, _SYSTEM, user, temperature=0.0)
@@ -60,4 +127,6 @@ def judge_answer(llm: StructuredLLM, question: Question, answer: str) -> Judgeme
             user,
             temperature=0.0,
         )
+    if question.accepted_points:
+        judgement = _merge_with_previous(question, judgement, already_matched)
     return judgement

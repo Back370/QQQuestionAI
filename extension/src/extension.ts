@@ -115,7 +115,7 @@ async function installHook(): Promise<void> {
       void vscode.window.showErrorMessage("フックのインストールに失敗しました。出力を確認してください");
     } else {
       void vscode.window.showInformationMessage(
-        "pre-commit フックをインストールしました。シェルのラッパー設定は出力パネルを参照してください"
+        "セットアップ完了（フック＋シェルラッパー）。ターミナルで source ~/.zshrc を実行してから git commit -q をどうぞ"
       );
     }
   });
