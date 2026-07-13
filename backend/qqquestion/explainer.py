@@ -9,9 +9,10 @@ Groundedness は「解説中の文のうち、内容語の3割以上がいずれ
 from __future__ import annotations
 
 import re
+from typing import Iterator
 
 from .knowledge_base import KnowledgeBase
-from .llm import StructuredLLM
+from .llm import StreamEvent, StructuredLLM, stream_generate
 from .models import Chunk, Explanation, Question
 from .question_gen import PERSONA
 
@@ -53,10 +54,16 @@ def groundedness(explanation_text: str, chunks: list[Chunk], question: Question)
     return grounded / len(sentences)
 
 
-def generate_explanation(
+def generate_explanation_stream(
     llm: StructuredLLM, kb: KnowledgeBase, question: Question
-) -> tuple[Explanation, float]:
-    """解説と groundedness を返す。"""
+) -> Iterator[StreamEvent]:
+    """解説をストリーミングする。
+
+    ("explanation_partial", {"explanation": str}) を逐次 yield し、
+    最後に ("explanation", (Explanation, groundedness)) を必ず1回 yield する。
+    解説は問題終了後（模範解答開示後）にしか呼ばれないため、途中経過を
+    そのまま UI に流してよい。
+    """
     chunks = kb.query(f"{question.topic} {question.text}", k=4)
     sources = "\n\n".join(
         f"[{i + 1}] {chunk.title} ({chunk.url})\n{chunk.text}"
@@ -70,6 +77,24 @@ def generate_explanation(
         f"要点: {question.accepted_points}\n\n"
         f"参考資料:\n{sources}"
     )
-    explanation = llm.generate(Explanation, _SYSTEM, user, temperature=0.2)
+    explanation: Explanation | None = None
+    for name, payload in stream_generate(llm, Explanation, _SYSTEM, user, temperature=0.2):
+        if name == "final":
+            explanation = payload  # type: ignore[assignment]
+            continue
+        text = payload.get("explanation")  # type: ignore[union-attr]
+        if isinstance(text, str) and text:
+            yield ("explanation_partial", {"explanation": text})
+    assert explanation is not None
     score = groundedness(explanation.explanation, chunks, question)
-    return explanation, score
+    yield ("explanation", (explanation, score))
+
+
+def generate_explanation(
+    llm: StructuredLLM, kb: KnowledgeBase, question: Question
+) -> tuple[Explanation, float]:
+    """解説と groundedness を返す。"""
+    for name, payload in generate_explanation_stream(llm, kb, question):
+        if name == "explanation":
+            return payload  # type: ignore[return-value]
+    raise AssertionError("generate_explanation_stream が explanation を返しませんでした")

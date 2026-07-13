@@ -36,6 +36,19 @@ export interface AnswerResponse {
   status: string;
 }
 
+// /answer/stream, /giveup/stream (SSE) の1イベント。
+// event: "judgement_partial" | "judgement" | "explanation_partial" | "result"
+export interface StreamEvent {
+  event: string;
+  reason?: string;
+  explanation?: string | AnswerResponse["explanation"];
+  judgement?: Judgement;
+  question_done?: boolean;
+  model_answer?: string;
+  next_question?: PublicQuestion | null;
+  status?: string;
+}
+
 export class BackendClient {
   constructor(private readonly port: number) {}
 
@@ -77,6 +90,59 @@ export class BackendClient {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ answer }),
     });
+  }
+
+  // 半二重ストリーミング版。SSE イベントを受信した側から onEvent に渡す
+  answerStream(
+    sessionId: string,
+    answer: string,
+    onEvent: (event: StreamEvent) => void
+  ): Promise<void> {
+    return this.stream(
+      `/quiz/${sessionId}/answer/stream`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer }),
+      },
+      onEvent
+    );
+  }
+
+  giveUpStream(sessionId: string, onEvent: (event: StreamEvent) => void): Promise<void> {
+    return this.stream(`/quiz/${sessionId}/giveup/stream`, { method: "POST" }, onEvent);
+  }
+
+  private async stream(
+    path: string,
+    init: RequestInit,
+    onEvent: (event: StreamEvent) => void
+  ): Promise<void> {
+    const response = await fetch(this.url(path), init);
+    if (!response.ok) {
+      throw new Error(`${path} -> HTTP ${response.status}: ${await response.text()}`);
+    }
+    if (!response.body) {
+      throw new Error(`${path} -> 空のレスポンスボディ`);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let boundary: number;
+      while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+        const raw = buffer.slice(0, boundary).trim();
+        buffer = buffer.slice(boundary + 2);
+        if (raw.startsWith("data: ")) {
+          onEvent(JSON.parse(raw.slice("data: ".length)) as StreamEvent);
+        }
+      }
+    }
   }
 
   hint(sessionId: string): Promise<{ hint: { hint: string; citations: string[] } }> {

@@ -69,6 +69,44 @@ def test_full_flow_via_api(client):
     )
 
 
+def test_incorrect_answer_hides_grading_points(client):
+    """未完了(不正解)の判定は accepted_points 由来の要点を漏らさない。
+
+    matched_points / missing_points は正解の骨子そのものなので、問題が
+    終わるまではクライアントへ返さない（answer/stream の途中経過抑止と同方針）。
+    """
+    session_id = _start(client)
+    response = client.post(
+        f"/quiz/{session_id}/answer", json={"answer": "全く関係のない答え"}
+    ).json()
+    assert response["judgement"]["verdict"] == "incorrect"
+    assert response["question_done"] is False
+    assert response.get("model_answer") is None
+    assert response["judgement"]["missing_points"] == []
+    assert response["judgement"]["matched_points"] == []
+    assert response["judgement"]["reason"] == ""
+
+
+def test_partial_answer_hides_points_but_keeps_feedback(client):
+    """部分正解でも要点リストは伏せる。
+
+    q1 の設問文自体が「再帰結合」を含む（設問がその語の使用を要求している）
+    ため、漏洩チェックは設問文ではなく judgement オブジェクトに限定する。
+    """
+    session_id = _start(client)
+    response = client.post(
+        f"/quiz/{session_id}/answer",
+        json={"answer": "隠れ層が再帰結合を持つ点が違います"},
+    ).json()
+    assert response["judgement"]["verdict"] == "partial"
+    assert response["question_done"] is False
+    assert response["judgement"]["missing_points"] == []
+    assert response["judgement"]["matched_points"] == []
+    accepted_points = ["再帰結合", "前の時刻の隠れ状態", "系列・文脈の保持"]
+    judgement_serialized = str(response["judgement"])
+    assert not any(point in judgement_serialized for point in accepted_points)
+
+
 def test_hint_and_giveup_via_api(client):
     session_id = _start(client)
     hint = client.post(f"/quiz/{session_id}/hint").json()["hint"]

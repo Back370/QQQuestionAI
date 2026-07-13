@@ -3,7 +3,7 @@
 // このパネルが答えを先に知ることはない。
 
 import * as vscode from "vscode";
-import { AnswerResponse, BackendClient, PublicQuestion } from "./backendClient";
+import { AnswerResponse, BackendClient, StreamEvent } from "./backendClient";
 
 export class QuizPanel {
   private static panels = new Map<string, QuizPanel>();
@@ -64,24 +64,78 @@ export class QuizPanel {
     try {
       switch (message.type) {
         case "answer": {
-          const result = await this.client.answer(this.sessionId, message.answer ?? "");
-          this.postResult(result);
+          const answer = message.answer ?? "";
+          try {
+            // 半二重ストリーミング: 判定理由・解説を受信した側から表示する
+            await this.client.answerStream(this.sessionId, answer, (event) =>
+              this.onStreamEvent(event)
+            );
+          } catch (error) {
+            if (!isNotFound(error)) {
+              throw error;
+            }
+            // ストリーム未対応の旧バックエンドへのフォールバック（ワンショット）
+            this.postFallback(await this.client.answer(this.sessionId, answer));
+          }
           break;
         }
         case "hint": {
+          // ヒントは答え漏洩チェックに全文が必要なためストリーミングしない
           const body = await this.client.hint(this.sessionId);
           this.post({ type: "hint", hint: body.hint });
           break;
         }
         case "giveup": {
-          const result = await this.client.giveUp(this.sessionId);
-          this.postResult(result);
+          try {
+            await this.client.giveUpStream(this.sessionId, (event) =>
+              this.onStreamEvent(event)
+            );
+          } catch (error) {
+            if (!isNotFound(error)) {
+              throw error;
+            }
+            this.postFallback(await this.client.giveUp(this.sessionId));
+          }
           break;
         }
       }
     } catch (error) {
       this.post({ type: "error", message: String(error) });
     }
+  }
+
+  private onStreamEvent(event: StreamEvent): void {
+    switch (event.event) {
+      case "judgement_partial":
+        this.post({ type: "stream_reason", reason: event.reason ?? "" });
+        break;
+      case "judgement":
+        this.post({
+          type: "judgement",
+          judgement: event.judgement,
+          question_done: event.question_done ?? false,
+          model_answer: event.model_answer,
+        });
+        break;
+      case "explanation_partial":
+        this.post({ type: "stream_explanation", explanation: event.explanation ?? "" });
+        break;
+      case "result": {
+        const { event: _name, ...result } = event;
+        this.postResult(result as unknown as AnswerResponse);
+        break;
+      }
+    }
+  }
+
+  private postFallback(result: AnswerResponse): void {
+    this.post({
+      type: "judgement",
+      judgement: result.judgement,
+      question_done: result.question_done,
+      model_answer: result.model_answer,
+    });
+    this.postResult(result);
   }
 
   private postResult(result: AnswerResponse): void {
@@ -100,6 +154,10 @@ export class QuizPanel {
       this.post({ type: "error", message: String(error) });
     }
   }
+}
+
+function isNotFound(error: unknown): boolean {
+  return String(error).includes("HTTP 404");
 }
 
 function renderHtml(): string {
@@ -131,7 +189,9 @@ function renderHtml(): string {
   .partial { border-left-color: #d29922; }
   .incorrect { border-left-color: #f85149; }
   .hint { border-left-color: #58a6ff; }
+  .pending { opacity: 0.85; }
   .citation { font-size: 0.85em; opacity: 0.8; }
+  button:disabled { opacity: 0.5; cursor: default; }
 </style>
 </head>
 <body>
@@ -157,15 +217,43 @@ function renderHtml(): string {
     div.className = "entry " + cls;
     div.textContent = text;
     el("log").prepend(div);
+    return div;
+  }
+
+  // ストリーミング表示中のエントリ。スナップショット全文で毎回上書きする
+  let liveReason = null;
+  let liveExplanation = null;
+
+  function updateLive(current, cls, text) {
+    if (!current) {
+      current = addEntry(cls, text);
+    } else {
+      current.className = "entry " + cls;
+      current.textContent = text;
+    }
+    return current;
+  }
+
+  function setBusy(busy) {
+    for (const id of ["submit", "hint", "giveup"]) {
+      el(id).disabled = busy;
+    }
   }
 
   el("submit").addEventListener("click", () => {
     const answer = el("answer").value.trim();
     if (!answer) { return; }
+    setBusy(true);
     vscode.postMessage({ type: "answer", answer });
   });
-  el("hint").addEventListener("click", () => vscode.postMessage({ type: "hint" }));
-  el("giveup").addEventListener("click", () => vscode.postMessage({ type: "giveup" }));
+  el("hint").addEventListener("click", () => {
+    setBusy(true);
+    vscode.postMessage({ type: "hint" });
+  });
+  el("giveup").addEventListener("click", () => {
+    setBusy(true);
+    vscode.postMessage({ type: "giveup" });
+  });
 
   function showQuestion(question) {
     const typeLabel = question.type === "prerequisite" ? "前提知識" : "実装の説明";
@@ -188,40 +276,61 @@ function renderHtml(): string {
     const message = event.data;
     if (message.type === "question") {
       showQuestion(message.question);
+    } else if (message.type === "stream_reason") {
+      // 判定理由の途中経過（半二重: 受信した側から表示）
+      liveReason = updateLive(liveReason, "pending", "先生> " + message.reason);
+    } else if (message.type === "judgement") {
+      const judgement = message.judgement;
+      let cls, text;
+      if (judgement.verdict === "correct") {
+        cls = "correct";
+        text = "先生> 正解です！🎉 " + judgement.reason;
+      } else if (judgement.verdict === "partial") {
+        cls = "partial";
+        text = "先生> 部分的に正解です。" + judgement.reason
+          + " 正解済みの部分は繰り返さなくてよいので、足りない部分だけ補足してください。";
+      } else if (message.question_done) {
+        cls = "incorrect";
+        text = "正解は「" + (message.model_answer || "") + "」でした。";
+      } else {
+        cls = "incorrect";
+        text = "先生> 残念、違います。「ヒント」ボタンで手がかりを出しますよ。";
+      }
+      updateLive(liveReason, cls, text);
+      liveReason = null;
+    } else if (message.type === "stream_explanation") {
+      // 解説の途中経過
+      liveExplanation = updateLive(
+        liveExplanation, "hint pending", "----- 解説 -----\\n" + message.explanation);
     } else if (message.type === "result") {
       const result = message.result;
-      const verdict = result.judgement.verdict;
-      if (verdict === "correct") {
-        addEntry("correct", "先生> 正解です！🎉 " + result.judgement.reason);
-      } else if (verdict === "partial") {
-        addEntry("partial", "先生> 部分的に正解です。" + result.judgement.reason
-          + " 正解済みの部分は繰り返さなくてよいので、足りない部分だけ補足してください。");
-      } else if (result.question_done) {
-        addEntry("incorrect", "正解は「" + (result.model_answer || "") + "」でした。");
-      } else {
-        addEntry("incorrect", "先生> 残念、違います。「ヒント」ボタンで手がかりを出しますよ。");
-      }
       if (result.explanation) {
         let text = "----- 解説 -----\\n" + result.explanation.explanation;
         if (result.explanation.citations.length) {
           text += "\\n出典:\\n" + result.explanation.citations.map((u) => "  - " + u).join("\\n");
         }
-        addEntry("hint", text);
+        updateLive(liveExplanation, "hint", text);
+        liveExplanation = null;
       }
       if (result.next_question) {
         showQuestion(result.next_question);
       }
+      setBusy(false);
     } else if (message.type === "hint") {
       let text = "先生(ヒント)> " + message.hint.hint;
       if (message.hint.citations.length) {
         text += "\\n" + message.hint.citations.map((u) => "  出典: " + u).join("\\n");
       }
       addEntry("hint", text);
+      setBusy(false);
     } else if (message.type === "report") {
       el("question-area").style.display = "none";
       addEntry("correct", message.rendered + "\\n理解度チェック完走。コミットを続行します。");
     } else if (message.type === "error") {
       addEntry("incorrect", "エラー: " + message.message);
+      liveReason = null;
+      liveExplanation = null;
+      setBusy(false);
     }
   });
 </script>

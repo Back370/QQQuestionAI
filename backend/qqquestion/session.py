@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from typing import Iterator
 
-from .explainer import generate_explanation
+from .explainer import generate_explanation_stream
 from .hint_gen import generate_hint
-from .judge import judge_answer
+from .judge import judge_answer_stream
 from .knowledge_base import KnowledgeBase
 from .learner_model import HistoryStore, LearnerState
 from .llm import StructuredLLM
@@ -43,6 +44,14 @@ class AnswerResult:
     explanation: Explanation | None = None  # 正解時に付く
     question_done: bool = False
     model_answer: str | None = None  # 問題が終わったときだけ開示
+
+
+def _consume(events: Iterator[tuple[str, object]]) -> AnswerResult:
+    """ストリームを読み捨てて最終結果だけ返す（ワンショット互換用）。"""
+    for name, payload in events:
+        if name == "result":
+            return payload  # type: ignore[return-value]
+    raise AssertionError("ストリームが result イベントを返しませんでした")
 
 
 class QuizSession:
@@ -114,10 +123,29 @@ class QuizSession:
     # ---- 操作系 -------------------------------------------------------
 
     def submit_answer(self, answer: str) -> AnswerResult:
+        return _consume(self.submit_answer_stream(answer))
+
+    def submit_answer_stream(self, answer: str) -> Iterator[tuple[str, object]]:
+        """判定→(正解なら)解説 を逐次イベントで yield する半二重ストリーム。
+
+        イベント（UI はこの順で受け取る）:
+          ("judgement_partial", {"reason": str})       — 判定理由の途中経過
+          ("judgement", {"judgement": Judgement,
+                          "question_done": bool,
+                          "model_answer": str | None})  — 判定の確定
+          ("explanation_partial", {"explanation": str}) — 解説の途中経過
+          ("result", AnswerResult)                      — 最終結果（必ず最後）
+        """
         state = self.current()
-        judgement = judge_answer(
+        judgement: Judgement | None = None
+        for name, payload in judge_answer_stream(
             self._llm, state.question, answer, already_matched=state.matched_points
-        )
+        ):
+            if name == "judgement":
+                judgement = payload  # type: ignore[assignment]
+            else:
+                yield (name, payload)
+        assert judgement is not None
         state.matched_points = list(judgement.matched_points)
 
         state.interaction.attempts += 1
@@ -125,17 +153,38 @@ class QuizSession:
             state.interaction.first_verdict = judgement.verdict
         state.interaction.final_verdict = judgement.verdict
 
-        if judgement.verdict == "correct":
-            explanation = self._finish_question(state, gave_up=False)
-            return AnswerResult(
+        done = judgement.verdict == "correct"
+        yield (
+            "judgement",
+            {
+                "judgement": judgement,
+                "question_done": done,
+                "model_answer": state.question.model_answer if done else None,
+            },
+        )
+        if not done:
+            yield ("result", AnswerResult(judgement=judgement))
+            return
+
+        explanation: Explanation | None = None
+        for name, payload in self._finish_question_stream(state):
+            if name == "explanation":
+                explanation = payload  # type: ignore[assignment]
+            else:
+                yield (name, payload)
+        yield (
+            "result",
+            AnswerResult(
                 judgement=judgement,
                 explanation=explanation,
                 question_done=True,
                 model_answer=state.question.model_answer,
-            )
-        return AnswerResult(judgement=judgement)
+            ),
+        )
 
     def request_hint(self) -> Hint:
+        # ヒントは全文が出そろってから答え漏洩チェックを通す必要があるため、
+        # 途中経過を UI に流せない（ストリーミング非対応のまま）
         state = self.current()
         hint, leaks = generate_hint(
             self._llm,
@@ -153,17 +202,38 @@ class QuizSession:
         return hint
 
     def give_up(self) -> AnswerResult:
+        return _consume(self.give_up_stream())
+
+    def give_up_stream(self) -> Iterator[tuple[str, object]]:
+        """ギブアップ処理。イベント仕様は submit_answer_stream と同じ。"""
         state = self.current()
         state.interaction.gave_up = True
         if state.interaction.first_verdict is None:
             state.interaction.first_verdict = "incorrect"
         state.interaction.final_verdict = "incorrect"
-        explanation = self._finish_question(state, gave_up=True)
-        return AnswerResult(
-            judgement=Judgement(verdict="incorrect", reason="ギブアップ"),
-            explanation=explanation,
-            question_done=True,
-            model_answer=state.question.model_answer,
+        judgement = Judgement(verdict="incorrect", reason="ギブアップ")
+        yield (
+            "judgement",
+            {
+                "judgement": judgement,
+                "question_done": True,
+                "model_answer": state.question.model_answer,
+            },
+        )
+        explanation: Explanation | None = None
+        for name, payload in self._finish_question_stream(state):
+            if name == "explanation":
+                explanation = payload  # type: ignore[assignment]
+            else:
+                yield (name, payload)
+        yield (
+            "result",
+            AnswerResult(
+                judgement=judgement,
+                explanation=explanation,
+                question_done=True,
+                model_answer=state.question.model_answer,
+            ),
         )
 
     def abort(self) -> None:
@@ -173,18 +243,28 @@ class QuizSession:
 
     # ---- 内部 ---------------------------------------------------------
 
-    def _finish_question(self, state: QuestionState, gave_up: bool) -> Explanation:
-        explanation, groundedness = generate_explanation(
+    def _finish_question_stream(
+        self, state: QuestionState
+    ) -> Iterator[tuple[str, object]]:
+        """解説を逐次 yield しつつ問題を閉じる。最後は ("explanation", Explanation)。"""
+        explanation: Explanation | None = None
+        groundedness_score: float | None = None
+        for name, payload in generate_explanation_stream(
             self._llm, self._kb, state.question
-        )
-        state.interaction.groundedness = groundedness
+        ):
+            if name == "explanation":
+                explanation, groundedness_score = payload  # type: ignore[misc]
+            else:
+                yield (name, payload)
+        assert explanation is not None
+        state.interaction.groundedness = groundedness_score
         state.done = True
         if self._history_store is not None:
             self._history_store.append(state.interaction)
         self._index += 1
         if self.finished:
             self.status = "completed"
-        return explanation
+        yield ("explanation", explanation)
 
     # ---- レポート -----------------------------------------------------
 

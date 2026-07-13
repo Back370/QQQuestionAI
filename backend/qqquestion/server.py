@@ -8,12 +8,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from . import diff_analyzer
@@ -76,9 +78,66 @@ def _session_or_404(deps: AppDeps, session_id: str) -> QuizSession:
     return session
 
 
+def _sse(event: str, data: dict) -> str:
+    """SSE の1イベント。クライアントは data 行の JSON だけ見ればよい。"""
+    return "data: " + json.dumps({"event": event, **data}, ensure_ascii=False) + "\n\n"
+
+
+def _public_judgement(judgement, question_done: bool) -> dict:
+    """UI へ返す判定。問題が終わるまでは採点内部情報を伏せる。
+
+    matched_points / missing_points は accepted_points（＝正解の骨子）を
+    そのまま含むため、問題完了前は空にする。incorrect の reason も欠けた
+    要点＝答えの手がかりを含みうるので伏せる（ストリーミング経路が途中
+    経過を流さないのと同じ方針）。partial の reason は「あと何が足りないか」
+    の学習フィードバックとして残す。問題完了後は模範解答が開示されるため
+    そのまま返す。
+    """
+    data = judgement.model_dump()
+    if question_done:
+        return data
+    data["matched_points"] = []
+    data["missing_points"] = []
+    if data.get("verdict") == "incorrect":
+        data["reason"] = ""
+    return data
+
+
+def _sse_response(session: QuizSession, events: Iterator[tuple[str, object]]):
+    """セッションのストリームイベントを SSE に変換する。
+
+    最後の result イベントは非ストリーム版 /answer と同じフィールドを持つ。
+    """
+
+    def generate() -> Iterator[str]:
+        for name, payload in events:
+            if name == "result":
+                data = _answer_payload(payload)
+                data["next_question"] = session.current_public()
+                data["status"] = session.status
+                yield _sse("result", data)
+            elif name == "judgement":
+                done = payload["question_done"]  # type: ignore[index]
+                data = {
+                    "judgement": _public_judgement(payload["judgement"], done),  # type: ignore[index]
+                    "question_done": done,
+                }
+                if done:
+                    data["model_answer"] = payload["model_answer"]  # type: ignore[index]
+                yield _sse("judgement", data)
+            else:  # judgement_partial / explanation_partial
+                yield _sse(name, payload)  # type: ignore[arg-type]
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 def _answer_payload(result) -> dict:
     payload: dict = {
-        "judgement": result.judgement.model_dump(),
+        "judgement": _public_judgement(result.judgement, result.question_done),
         "question_done": result.question_done,
     }
     if result.question_done:
@@ -161,6 +220,22 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
         payload["next_question"] = session.current_public()
         payload["status"] = session.status
         return payload
+
+    @app.post("/quiz/{session_id}/answer/stream")
+    def answer_stream(session_id: str, request: AnswerRequest):
+        """半二重ストリーミング版 answer。判定理由・解説を出た側から流す。"""
+        session = _session_or_404(deps, session_id)
+        if session.finished:
+            raise HTTPException(status_code=409, detail="全問終了しています")
+        return _sse_response(session, session.submit_answer_stream(request.answer))
+
+    @app.post("/quiz/{session_id}/giveup/stream")
+    def giveup_stream(session_id: str):
+        """半二重ストリーミング版 giveup。解説を出た側から流す。"""
+        session = _session_or_404(deps, session_id)
+        if session.finished:
+            raise HTTPException(status_code=409, detail="全問終了しています")
+        return _sse_response(session, session.give_up_stream())
 
     @app.post("/quiz/{session_id}/hint")
     def hint(session_id: str):
