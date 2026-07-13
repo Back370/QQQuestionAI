@@ -44,7 +44,8 @@ export class QuizPanel {
       }
     });
 
-    void this.loadQuestion();
+    // 問題の取得は Webview 側スクリプトの "ready" 通知を待ってから行う。
+    // ここで即取得すると、リスナー登録前に postMessage が届いて破棄されうる
   }
 
   private post(message: unknown): void {
@@ -52,17 +53,26 @@ export class QuizPanel {
   }
 
   private async loadQuestion(): Promise<void> {
-    const body = await this.client.question(this.sessionId);
-    if (body.question) {
-      this.post({ type: "question", question: body.question });
-    } else {
-      await this.completeSession();
+    try {
+      const body = await this.client.question(this.sessionId);
+      if (body.question) {
+        this.post({ type: "question", question: body.question });
+      } else {
+        await this.completeSession();
+      }
+    } catch (error) {
+      this.post({ type: "load_error", message: String(error) });
     }
   }
 
   private async handle(message: { type: string; answer?: string }): Promise<void> {
     try {
       switch (message.type) {
+        case "ready":
+        case "reload": {
+          await this.loadQuestion();
+          break;
+        }
         case "answer": {
           const answer = message.answer ?? "";
           try {
@@ -205,6 +215,7 @@ function renderHtml(): string {
       <button id="submit">解答する</button>
       <button id="hint" class="secondary">ヒント</button>
       <button id="giveup" class="secondary">ギブアップ</button>
+      <button id="retry" class="secondary" style="display:none">再読み込み</button>
     </div>
   </div>
   <div class="log" id="log"></div>
@@ -254,6 +265,11 @@ function renderHtml(): string {
     setBusy(true);
     vscode.postMessage({ type: "giveup" });
   });
+  el("retry").addEventListener("click", () => {
+    el("retry").style.display = "none";
+    el("title").textContent = "読み込み中…";
+    vscode.postMessage({ type: "reload" });
+  });
 
   function showQuestion(question) {
     const typeLabel = question.type === "prerequisite" ? "前提知識" : "実装の説明";
@@ -275,7 +291,13 @@ function renderHtml(): string {
   window.addEventListener("message", (event) => {
     const message = event.data;
     if (message.type === "question") {
+      el("retry").style.display = "none";
       showQuestion(message.question);
+    } else if (message.type === "load_error") {
+      el("title").textContent = "問題を読み込めませんでした";
+      el("retry").style.display = "";
+      addEntry("incorrect", "エラー: " + message.message
+        + "\\n「再読み込み」で再試行できます。改善しない場合はパネルを閉じるとコミットを中止できます。");
     } else if (message.type === "stream_reason") {
       // 判定理由の途中経過（半二重: 受信した側から表示）
       liveReason = updateLive(liveReason, "pending", "先生> " + message.reason);
@@ -333,6 +355,9 @@ function renderHtml(): string {
       setBusy(false);
     }
   });
+
+  // リスナー登録が済んでから問題を要求する（登録前の postMessage 取りこぼし防止）
+  vscode.postMessage({ type: "ready" });
 </script>
 </body>
 </html>`;
