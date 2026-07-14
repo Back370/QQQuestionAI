@@ -24,6 +24,76 @@ StreamEvent = tuple[str, object]
 # gemini-2.0-flash は無料枠の割り当てが終了している(429 limit:0)ため 2.5 を既定にする
 DEFAULT_MODEL = "gemini-2.5-flash"
 
+# 1回のLLM呼び出しの応答待ち上限（秒）。これを超えると打ち切って例外にする。
+# タイムアウトが無いと、API無応答・レート制限のリトライ待ちで prepare_first() が
+# 返らず、UI が「問題を生成中…」のまま固まる（ハングの主因）。QQQ_LLM_TIMEOUT で調整可。
+DEFAULT_TIMEOUT = 45.0
+# langchain-google-genai の既定リトライは6回（指数バックオフ）で、無応答時に
+# 待ち時間が数分に膨れる。ハングを避けるため回数を絞る。
+DEFAULT_MAX_RETRIES = 2
+
+_NO_KEY_MESSAGE = (
+    "GOOGLE_API_KEY が設定されていません。"
+    "backend/.env に GOOGLE_API_KEY=... を書くか（env.example 参照）、"
+    "環境変数で渡してください。オフラインで試すには QQQ_FAKE_LLM=1 です。"
+)
+
+
+class LLMUnavailableError(RuntimeError):
+    """LLM(API) が利用できないときのエラー。
+
+    message はそのまま UI に出せる日本語にする（fail-open 経路が session.error
+    に載せ、拡張が「生成に失敗したためスキップ」として表示する）。
+    """
+
+
+def _llm_timeout() -> float:
+    try:
+        return float(os.environ.get("QQQ_LLM_TIMEOUT", DEFAULT_TIMEOUT))
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT
+
+
+def _is_unavailable_error(error: Exception) -> bool:
+    """API そのものが使えない失敗（タイムアウト・レート制限・認証）か。
+
+    これらは速度優先の generate_fast から通常経路へフォールバックしても直らない
+    ので、二重待ちを避けて即座に伝える判断に使う。
+    """
+    if isinstance(error, TimeoutError):
+        return True
+    text = str(error).lower()
+    keywords = (
+        "timeout", "deadline", "429", "quota", "rate limit", "exhausted",
+        "api key", "api_key", "unauthenticated", "permission", "401", "403",
+    )
+    return any(word in text for word in keywords)
+
+
+def _classify_llm_error(error: Exception) -> str:
+    """LLM 呼び出しの失敗を、利用者が次の一手を打てる日本語メッセージに変換する。"""
+    text = str(error).lower()
+    if isinstance(error, TimeoutError) or "timeout" in text or "deadline" in text:
+        return (
+            "AIサービスが時間内に応答しませんでした（タイムアウト）。"
+            "ネットワークやAPIの状態を確認し、再度お試しください。"
+        )
+    if "429" in text or "quota" in text or "rate limit" in text or "exhausted" in text:
+        return (
+            "AIサービスの利用上限（レート制限・クォータ）に達しました。"
+            "しばらく待つか、別のAPIキーで再試行してください。"
+        )
+    if (
+        "api key" in text
+        or "api_key" in text
+        or "unauthenticated" in text
+        or "permission" in text
+        or "401" in text
+        or "403" in text
+    ):
+        return "APIキーが無効か権限がありません。GOOGLE_API_KEY を確認してください。"
+    return f"AIサービスの呼び出しに失敗しました: {error}"
+
 
 class StructuredLLM(Protocol):
     """全役割共通の LLM インタフェース。"""
@@ -38,23 +108,39 @@ class GeminiLLM:
 
     def __init__(self, model: str | None = None):
         self._model_name = model or os.environ.get("QQQ_MODEL", DEFAULT_MODEL)
+        # APIキーの検査は呼び出し時に遅延させる。起動時に例外を投げると
+        # サーバが立ち上がらず、ユーザーに何も表示できないまま静かにスキップに
+        # なるため。呼び出し時に LLMUnavailableError を投げれば、fail-open 経路が
+        # UI に「APIキー未設定」を出せる。
+
+    def _require_key(self) -> None:
         if not os.environ.get("GOOGLE_API_KEY"):
-            raise RuntimeError(
-                "GOOGLE_API_KEY が設定されていません。"
-                "backend/.env に GOOGLE_API_KEY=... を書くか（env.example 参照）、"
-                "環境変数で渡してください。オフラインで試すには QQQ_FAKE_LLM=1 です。"
-            )
+            raise LLMUnavailableError(_NO_KEY_MESSAGE)
+
+    def _chat(self, temperature: float, **extra):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        return ChatGoogleGenerativeAI(
+            model=self._model_name,
+            temperature=temperature,
+            timeout=_llm_timeout(),
+            max_retries=DEFAULT_MAX_RETRIES,
+            **extra,
+        )
 
     def generate(
         self, schema: type[T], system: str, user: str, temperature: float = 0.0
     ) -> T:
+        self._require_key()
         from langchain_core.messages import HumanMessage, SystemMessage
-        from langchain_google_genai import ChatGoogleGenerativeAI
 
-        chat = ChatGoogleGenerativeAI(
-            model=self._model_name, temperature=temperature
-        ).with_structured_output(schema)
-        result = chat.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+        chat = self._chat(temperature).with_structured_output(schema)
+        try:
+            result = chat.invoke(
+                [SystemMessage(content=system), HumanMessage(content=user)]
+            )
+        except Exception as error:
+            raise LLMUnavailableError(_classify_llm_error(error)) from error
         if isinstance(result, dict):
             result = schema.model_validate(result)
         return result
@@ -66,22 +152,30 @@ class GeminiLLM:
 
         第1問の先行生成など、体感待ち時間が最重要の呼び出しで使う。
         thinking_budget 非対応のモデル・ライブラリでは通常の generate に
-        フォールバックする。
+        フォールバックする。ただし API 自体が使えない（キー無し・タイムアウト・
+        レート制限）場合はフォールバックしても同じく失敗するため、そのまま
+        LLMUnavailableError を投げて二重待ちを避ける。
         """
-        try:
-            from langchain_core.messages import HumanMessage, SystemMessage
-            from langchain_google_genai import ChatGoogleGenerativeAI
+        self._require_key()
+        from langchain_core.messages import HumanMessage, SystemMessage
 
-            chat = ChatGoogleGenerativeAI(
-                model=self._model_name, temperature=temperature, thinking_budget=0
-            ).with_structured_output(schema)
+        try:
+            chat = self._chat(temperature, thinking_budget=0).with_structured_output(
+                schema
+            )
             result = chat.invoke(
                 [SystemMessage(content=system), HumanMessage(content=user)]
             )
             if isinstance(result, dict):
                 result = schema.model_validate(result)
             return result
-        except Exception:
+        except LLMUnavailableError:
+            raise
+        except Exception as error:
+            # API の利用不能はフォールバックしても直らないので即座に伝える。
+            # それ以外（thinking_budget 非対応など）は通常経路で作り直す。
+            if _is_unavailable_error(error):
+                raise LLMUnavailableError(_classify_llm_error(error)) from error
             return self.generate(schema, system, user, temperature=temperature)
 
     def generate_stream(
@@ -91,21 +185,18 @@ class GeminiLLM:
 
         ストリーム途中の失敗・最終検証エラー時は非ストリームの generate() に
         フォールバックする（呼び出し側は snapshot 置き換えで表示する前提）。
+        API 自体が使えない場合は generate() 側で LLMUnavailableError になる。
         """
+        self._require_key()
         from langchain_core.messages import HumanMessage, SystemMessage
         from langchain_core.utils.json import parse_partial_json
-        from langchain_google_genai import ChatGoogleGenerativeAI
 
         schema_note = (
             "\n\n出力は次の JSON Schema に従う JSON オブジェクトのみとし、"
             "コードフェンスや前置きを付けないこと:\n"
             + json.dumps(schema.model_json_schema(), ensure_ascii=False)
         )
-        chat = ChatGoogleGenerativeAI(
-            model=self._model_name,
-            temperature=temperature,
-            response_mime_type="application/json",
-        )
+        chat = self._chat(temperature, response_mime_type="application/json")
         buffer = ""
         last_partial: dict | None = None
         final: T | None = None
@@ -125,6 +216,7 @@ class GeminiLLM:
         except Exception:
             final = None
         if final is None:
+            # generate() はタイムアウト等を LLMUnavailableError に変換して投げる
             final = self.generate(schema, system, user, temperature=temperature)
             yield ("partial", final.model_dump())
         yield ("final", final)

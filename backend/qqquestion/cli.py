@@ -21,7 +21,7 @@ from .knowledge_base import (
     create_search_provider,
 )
 from .learner_model import HistoryStore, load_learner_state
-from .llm import create_llm
+from .llm import LLMUnavailableError, create_llm
 from .session import QuizSession
 
 BANNER = """\
@@ -61,13 +61,17 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
     if learner_state.weak_topics():
         print(f"前回の苦手傾向: {' / '.join(learner_state.weak_topics())} → 優先出題します\n")
 
-    session = QuizSession(
-        llm=create_llm(),
-        kb=kb,
-        diff_ctx=diff_ctx,
-        learner_state=learner_state,
-        history_store=HistoryStore(data / "history.jsonl"),
-    )
+    try:
+        session = QuizSession(
+            llm=create_llm(),
+            kb=kb,
+            diff_ctx=diff_ctx,
+            learner_state=learner_state,
+            history_store=HistoryStore(data / "history.jsonl"),
+        )
+    except LLMUnavailableError as error:
+        print(f"\n出題を生成できませんでした: {error}")
+        return 1
 
     while not session.finished:
         view = session.current_public()
