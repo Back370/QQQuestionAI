@@ -25,7 +25,11 @@ from .models import (
     Judgement,
     Question,
 )
-from .question_gen import TOTAL_QUESTIONS, generate_questions_stream
+from .question_gen import (
+    TOTAL_QUESTIONS,
+    generate_first_question,
+    generate_remaining_questions_stream,
+)
 
 
 @dataclass
@@ -83,15 +87,49 @@ class QuizSession:
             self.prepare()
 
     def prepare(self, fail_open: bool = False) -> None:
-        """出題を1問ずつ確定させる。第1問の確定時点から UI は表示を始められる。
+        """全問を同期で生成する（CLI・テスト用の互換経路）。
 
-        fail_open=True では生成失敗でも例外を投げず、確定済みの問題だけで
-        続行する（0問なら completed にしてコミットを通す＝従来のスキップ相当）。
+        サーバは prepare_first() → バックグラウンドで prepare_rest() と
+        分割して呼び、第1問の表示を待ち時間なしにする。
+        """
+        self.prepare_first(fail_open=fail_open)
+        self.prepare_rest(fail_open=fail_open)
+
+    def prepare_first(self, fail_open: bool = False) -> None:
+        """第1問だけを先行生成する。確定した時点で UI は出題を始められる。
+
+        fail_open=True では生成失敗でも例外を投げず、completed にして
+        コミットを通す（従来のスキップ相当）。
         """
         try:
-            for question in generate_questions_stream(
+            question = generate_first_question(
                 self._llm,
                 self.diff_ctx,
+                weak_topics=self._learner.weak_topics(),
+                difficulty_bias=self._learner.difficulty_bias(),
+            )
+            self._states.append(self._make_state(question))
+        except Exception as error:
+            self._preparing = False
+            if not fail_open:
+                raise
+            self.error = str(error)
+            if self.status == "in_progress":
+                self.status = "completed"
+
+    def prepare_rest(self, fail_open: bool = False) -> None:
+        """第2〜5問を生成し、確定した問題から順に追加する。
+
+        第1問の解答中にバックグラウンドで実行される想定。fail_open=True では
+        生成失敗でも例外を投げず、確定済みの問題だけで続行する。
+        """
+        if not self._states:
+            return  # 第1問の生成に失敗している（prepare_first 側で処理済み）
+        try:
+            for question in generate_remaining_questions_stream(
+                self._llm,
+                self.diff_ctx,
+                self._states[0].question,
                 weak_topics=self._learner.weak_topics(),
                 difficulty_bias=self._learner.difficulty_bias(),
             ):
@@ -101,10 +139,11 @@ class QuizSession:
         except Exception as error:
             if not fail_open:
                 raise
-            self.error = str(error)
+            self.error = str(error)  # 確定済みの問題だけで続行
         finally:
             self._preparing = False
-            if not self._states and self.status == "in_progress":
+            # 準備完了前にユーザーが確定済みの全問を解き終えていた場合の後始末
+            if self.finished and self.status == "in_progress":
                 self.status = "completed"
 
     def _make_state(self, question: Question) -> QuestionState:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
@@ -33,6 +34,10 @@ from .session import QuizSession
 DEFAULT_PORT = 8756
 
 
+def _spawn_daemon_thread(task: Callable[[], None]) -> None:
+    threading.Thread(target=task, daemon=True).start()
+
+
 @dataclass
 class AppDeps:
     llm: StructuredLLM
@@ -42,6 +47,8 @@ class AppDeps:
     kb_builder: KnowledgeBaseBuilder | None = None
     sessions: dict[str, QuizSession] = field(default_factory=dict)
     claimed: set[str] = field(default_factory=set)
+    # 残り問題の生成・知識ベース構築を実行する場所（テストでは同期実行に差し替える）
+    run_in_background: Callable[[Callable[[], None]], None] = _spawn_daemon_thread
 
     @property
     def history_path(self) -> Path:
@@ -173,13 +180,19 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
             defer_questions=True,
         )
         # 生成前にセッションを公開する: 拡張の /quiz/pending ポーリングが即座に
-        # 拾ってパネルを開き、「生成中」を表示できる。出題は1問ずつ確定し、
-        # 第1問ができた時点でパネルに表示される
+        # 拾ってパネルを開き、「生成中」を表示できる
         deps.sessions[session.id] = session
-        session.prepare(fail_open=True)
-        # 知識ベース構築（Web検索）はヒント・解説にしか使わないため出題の後に回す
-        if deps.kb_builder is not None and session.status == "in_progress":
-            deps.kb_builder.build_for_topics(diff_ctx.topics)
+        # 第1問だけ同期生成して即出題する。残り4問と知識ベース構築（Web検索）は
+        # バックグラウンドに回し、第1問の解答中に進める
+        session.prepare_first(fail_open=True)
+
+        def prepare_in_background() -> None:
+            session.prepare_rest(fail_open=True)
+            if deps.kb_builder is not None and session.status == "in_progress":
+                deps.kb_builder.build_for_topics(diff_ctx.topics)
+
+        if session.status == "in_progress":
+            deps.run_in_background(prepare_in_background)
         return {
             "session_id": session.id,
             "topics": diff_ctx.topics,

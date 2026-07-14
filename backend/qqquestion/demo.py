@@ -179,11 +179,18 @@ def _explain_by_rule(system: str, user: str) -> Explanation:
     )
 
 
+def _question_set_by_rule(system: str, user: str) -> QuestionSet:
+    # 「残り4問」の要求（第1問は出題済み）なら q2〜q5 を返す
+    if "出題済み" in user:
+        return QuestionSet(questions=list(DEMO_QUESTIONS[1:]))
+    return QuestionSet(questions=list(DEMO_QUESTIONS))
+
+
 def build_demo_llm() -> FakeLLM:
     llm = FakeLLM()
-    llm.set_default(
-        QuestionSet, lambda system, user: QuestionSet(questions=list(DEMO_QUESTIONS))
-    )
+    llm.set_default(QuestionSet, _question_set_by_rule)
+    # 第1問の先行生成（Question スキーマ単体）用
+    llm.set_default(Question, lambda system, user: DEMO_QUESTIONS[0].model_copy())
     llm.set_default(Judgement, _judge_by_rule)
     llm.set_default(Hint, _hint_by_rule)
     llm.set_default(Explanation, _explain_by_rule)

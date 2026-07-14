@@ -17,6 +17,7 @@ def client(tmp_path):
         kb=InMemoryKnowledgeBase(),
         data_dir=tmp_path,
         diff_provider=lambda repo: analyze(SAMPLE_DIFF if repo != "empty" else ""),
+        run_in_background=lambda task: task(),  # テストでは決定的に同期実行
     )
     return TestClient(create_app(deps))
 

@@ -13,7 +13,7 @@ from typing import Iterator
 
 from pydantic import ValidationError
 
-from .llm import StructuredLLM, stream_generate
+from .llm import StructuredLLM, fast_generate, stream_generate
 from .models import DiffContext, Question, QuestionSet
 
 PERSONA = (
@@ -144,24 +144,20 @@ def _build_user(
     )
 
 
-def generate_questions_stream(
-    llm: StructuredLLM,
-    diff_ctx: DiffContext,
-    weak_topics: list[str] | None = None,
-    difficulty_bias: dict[str, int] | None = None,
+def _stream_question_set(
+    llm: StructuredLLM, system: str, user: str, start_slot: int
 ) -> Iterator[Question]:
-    """確定した問題から1問ずつ yield する（半二重ストリーミング）。
+    """QuestionSet ストリームから start_slot 以降のスロットを1問ずつ確定させる。
 
-    第1問が確定した時点で UI は出題を始められる。ストリーム途中では、
-    構成（前提2→実装3）と一問一答を満たす問題だけを先行して確定させる。
-    満たさない問題が現れたら先行確定を止め、残りは全問そろってから
-    従来どおり並べ替え・書き直しで補正する。
+    ストリーム途中では、構成（EXPECTED_TYPES）と一問一答を満たす問題だけを
+    先行して確定させる。満たさない問題が現れたら先行確定を止め、残りは
+    全問そろってから並べ替え・書き直しで補正する。
     """
-    user = _build_user(diff_ctx, weak_topics, difficulty_bias)
+    expected = EXPECTED_TYPES[start_slot:]
     published = 0
     frozen = False  # 構成違反を見つけたら先行確定をやめて最終補正に回す
     final_set: QuestionSet | None = None
-    for name, payload in stream_generate(llm, QuestionSet, _SYSTEM, user, temperature=0.4):
+    for name, payload in stream_generate(llm, QuestionSet, system, user, temperature=0.4):
         if name == "final":
             final_set = payload  # type: ignore[assignment]
             continue
@@ -171,26 +167,113 @@ def generate_questions_stream(
         if not isinstance(items, list):
             continue
         # 配列の最後の要素は生成途中の可能性があるため、その手前までを確定候補にする
-        for index in range(published, min(len(items) - 1, TOTAL_QUESTIONS)):
+        for index in range(published, min(len(items) - 1, len(expected))):
             try:
                 question = Question.model_validate(items[index])
             except ValidationError:
                 frozen = True
                 break
-            if question.type != EXPECTED_TYPES[index] or is_multi_question(question.text):
+            if question.type != expected[index] or is_multi_question(question.text):
                 frozen = True
                 break
             published += 1
-            yield question.model_copy(update={"id": f"q{published}"})
+            yield question.model_copy(update={"id": f"q{start_slot + published}"})
     assert final_set is not None
-    if len(final_set.questions) < TOTAL_QUESTIONS:
-        raise ValueError(f"出題が5問未満です: {len(final_set.questions)}問")
+    if len(final_set.questions) < len(expected):
+        raise ValueError(f"出題が{len(expected)}問未満です: {len(final_set.questions)}問")
     # 部分パースで確定した問題は最終リストの先頭 published 件と同一
-    for question in _fill_structure(published, final_set.questions[published:]):
+    for question in _fill_structure(start_slot + published, final_set.questions[published:]):
         # 一問一答の強制: 複数の問いを束ねた問題は1問に絞って書き直させる
         if is_multi_question(question.text):
             question = _rewrite_as_single_question(llm, question)
         yield question
+
+
+_FIRST_SYSTEM = PERSONA + """
+与えられたコミット差分から、記述式の理解度確認問題を1問だけ生成してください。
+これは全5問の第1問で、type="prerequisite"（差分が前提とする基礎知識を問う）とします。
+
+必ず以下を含める:
+- model_answer: 模範解答
+- accepted_points: 正解と認めるために解答に含まれるべき要点のリスト（2〜4個）
+- rubric: 採点基準（どの要点が揃えば correct / 一部なら partial かを明文化）
+- topic: 問題のトピック名（与えられたトピック候補から選ぶか近いものを付ける）
+- difficulty: 1〜3
+
+出題形式の厳守（記述式の一問一答）:
+- 問いは1つだけ。複数の論点を束ねず、疑問文は1つまで
+- 選択式にしない。日本語で出題する
+"""
+
+_REST_SYSTEM = PERSONA + """
+与えられたコミット差分から、記述式の理解度確認問題をちょうど4問生成してください。
+全5問のうち第1問は出題済みで、残りの第2〜5問を作ります。
+
+構成の厳守:
+- 1問目(第2問): type="prerequisite"（差分が前提とする基礎知識を問う）
+- 2〜4問目(第3〜5問): type="implementation"（差分の特定箇所が何をしているか・
+  なぜそう書くかを問う。code_snippet に差分から該当コードを引用すること）
+
+出題済みの第1問と重複する内容を出さないこと。
+
+各問には必ず以下を含める:
+- model_answer: 模範解答
+- accepted_points: 正解と認めるために解答に含まれるべき要点のリスト（2〜4個）
+- rubric: 採点基準（どの要点が揃えば correct / 一部なら partial かを明文化）
+- topic: 問題のトピック名（与えられたトピック候補から選ぶか近いものを付ける）
+- difficulty: 1〜3
+
+出題形式の厳守（記述式の一問一答）:
+- 1問につき問いは1つだけ。複数の論点を束ねず、疑問文は各問1つまで
+- 選択式にしない。日本語で出題する
+"""
+
+
+def generate_first_question(
+    llm: StructuredLLM,
+    diff_ctx: DiffContext,
+    weak_topics: list[str] | None = None,
+    difficulty_bias: dict[str, int] | None = None,
+) -> Question:
+    """第1問（前提知識）だけを先行生成する。UI はこれで出題を始められる。
+
+    体感待ち時間に直結するため速度優先（Gemini では thinking 無効）で生成する。
+    """
+    user = _build_user(diff_ctx, weak_topics, difficulty_bias)
+    question = fast_generate(llm, Question, _FIRST_SYSTEM, user, temperature=0.4)
+    question = question.model_copy(update={"id": "q1", "type": "prerequisite"})
+    if is_multi_question(question.text):
+        question = _rewrite_as_single_question(llm, question)
+    return question
+
+
+def generate_remaining_questions_stream(
+    llm: StructuredLLM,
+    diff_ctx: DiffContext,
+    first_question: Question,
+    weak_topics: list[str] | None = None,
+    difficulty_bias: dict[str, int] | None = None,
+) -> Iterator[Question]:
+    """第2〜5問を生成し、確定した問題から1問ずつ yield する。
+
+    第1問の解答中にバックグラウンドで呼ばれる想定。
+    """
+    user = (
+        _build_user(diff_ctx, weak_topics, difficulty_bias)
+        + f"\n\n出題済みの第1問（重複しないこと）:\n{first_question.text}"
+    )
+    yield from _stream_question_set(llm, _REST_SYSTEM, user, start_slot=1)
+
+
+def generate_questions_stream(
+    llm: StructuredLLM,
+    diff_ctx: DiffContext,
+    weak_topics: list[str] | None = None,
+    difficulty_bias: dict[str, int] | None = None,
+) -> Iterator[Question]:
+    """5問を1回の生成でストリームする（一括経路）。確定した問題から yield する。"""
+    user = _build_user(diff_ctx, weak_topics, difficulty_bias)
+    yield from _stream_question_set(llm, _SYSTEM, user, start_slot=0)
 
 
 def generate_questions(
