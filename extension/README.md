@@ -16,7 +16,7 @@
 
 下は実際の出題画面（第3問／難易度2・書いたコードに由来する問題）の例です。
 
-![出題画面の例](problem_sample.png)
+![出題画面の例](https://raw.githubusercontent.com/Back370/QQQuestionAI/main/extension/problem_sample.png)
 
 ## 前提
 
