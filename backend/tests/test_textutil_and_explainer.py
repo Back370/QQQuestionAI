@@ -1,5 +1,5 @@
 from qqquestion.explainer import generate_explanation, groundedness
-from qqquestion.models import Chunk, Explanation
+from qqquestion.models import Chunk, Explanation, Hint
 from qqquestion.textutil import contains_answer, normalize
 
 
@@ -47,3 +47,13 @@ def test_generate_explanation_passes_chunks_and_scores(fake_llm, kb, demo_questi
     assert score == 1.0
     assert fake_llm.calls[0]["temperature"] == 0.2
     assert "再帰結合を持ち" in fake_llm.calls[0]["user"]  # チャンクが根拠として渡る
+
+
+def test_citations_deduped_preserving_order():
+    # 同一URLの複数チャンクを引用すると出典が重複するので、順序を保って除去する
+    url = "https://ejje.weblio.jp/content/multiply"
+    explanation = Explanation(explanation="解説", citations=[url, url, url, url])
+    assert explanation.citations == [url]
+
+    hint = Hint(hint="ヒント", citations=["https://a", "https://b", "https://a"])
+    assert hint.citations == ["https://a", "https://b"]
