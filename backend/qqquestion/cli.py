@@ -21,7 +21,7 @@ from .knowledge_base import (
     create_search_provider,
 )
 from .learner_model import HistoryStore, load_learner_state
-from .llm import create_llm
+from .llm import LLMUnavailableError, create_llm
 from .session import QuizSession
 
 BANNER = """\
@@ -61,13 +61,17 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
     if learner_state.weak_topics():
         print(f"前回の苦手傾向: {' / '.join(learner_state.weak_topics())} → 優先出題します\n")
 
-    session = QuizSession(
-        llm=create_llm(),
-        kb=kb,
-        diff_ctx=diff_ctx,
-        learner_state=learner_state,
-        history_store=HistoryStore(data / "history.jsonl"),
-    )
+    try:
+        session = QuizSession(
+            llm=create_llm(),
+            kb=kb,
+            diff_ctx=diff_ctx,
+            learner_state=learner_state,
+            history_store=HistoryStore(data / "history.jsonl"),
+        )
+    except LLMUnavailableError as error:
+        print(f"\n出題を生成できませんでした: {error}")
+        return 1
 
     while not session.finished:
         view = session.current_public()
@@ -100,24 +104,12 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
                     print(f"  出典: {url}")
                 continue
             if user_input in ("ギブアップ", "giveup"):
-                result = session.give_up()
-                print(f"\n正解は「{result.model_answer}」でした。")
-                _print_explanation(result)
+                _consume_stream(session.give_up_stream())
                 break
 
-            result = session.submit_answer(user_input)
-            verdict = result.judgement.verdict
-            if verdict == "correct":
-                print(f"先生> 正解です！🎉 ({result.judgement.reason})")
-                _print_explanation(result)
+            result = _consume_stream(session.submit_answer_stream(user_input))
+            if result.judgement.verdict == "correct":
                 break
-            if verdict == "partial":
-                print(
-                    f"先生> 部分的に正解です。{result.judgement.reason} "
-                    "正解済みの部分は繰り返さなくてよいので、足りない部分だけ補足してください。"
-                )
-            else:
-                print("先生> 残念、違います。「ヒント」と言ってくれれば手がかりを出しますよ。")
         print()
 
     print(session.report().render())
@@ -125,16 +117,71 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
     return 0
 
 
-def _print_explanation(result) -> None:
-    if result.explanation is None:
-        return
-    print("\n----- 解説 -----")
-    print(result.explanation.explanation)
-    if result.explanation.citations:
-        print("出典:")
-        for url in result.explanation.citations:
-            print(f"  - {url}")
-    print("----------------")
+class _TypeWriter:
+    """スナップショット（毎回全文）を受け取り、増分だけを逐次表示する。"""
+
+    def __init__(self):
+        self._shown = ""
+
+    @property
+    def started(self) -> bool:
+        return bool(self._shown)
+
+    def update(self, text: str) -> None:
+        if text.startswith(self._shown):
+            delta = text[len(self._shown):]
+        else:
+            delta = "\n" + text  # フォールバック等で全文が差し替わった場合
+        if delta:
+            print(delta, end="", flush=True)
+            self._shown = text
+
+
+def _consume_stream(events):
+    """セッションのストリームを逐次表示しながら最終結果を返す（半二重）。"""
+    reason = _TypeWriter()
+    explanation = _TypeWriter()
+    result = None
+    for name, payload in events:
+        if name == "judgement_partial":
+            if not reason.started:
+                print("先生> ", end="", flush=True)
+            reason.update(payload["reason"])
+        elif name == "judgement":
+            if reason.started:
+                print()
+            _print_verdict(payload, streamed_reason=reason.started)
+        elif name == "explanation_partial":
+            if not explanation.started:
+                print("\n----- 解説 -----")
+            explanation.update(payload["explanation"])
+        elif name == "result":
+            result = payload
+    if explanation.started:
+        print()
+        if result is not None and result.explanation and result.explanation.citations:
+            print("出典:")
+            for url in result.explanation.citations:
+                print(f"  - {url}")
+        print("----------------")
+    return result
+
+
+def _print_verdict(payload, streamed_reason: bool) -> None:
+    judgement = payload["judgement"]
+    if judgement.verdict == "correct":
+        suffix = "" if streamed_reason else f" ({judgement.reason})"
+        print(f"先生> 正解です！🎉{suffix}")
+    elif judgement.verdict == "partial":
+        middle = "" if streamed_reason else f"{judgement.reason} "
+        print(
+            f"先生> 部分的に正解です。{middle}"
+            "正解済みの部分は繰り返さなくてよいので、足りない部分だけ補足してください。"
+        )
+    elif payload["question_done"]:  # ギブアップ
+        print(f"\n正解は「{payload['model_answer']}」でした。")
+    else:
+        print("先生> 残念、違います。「ヒント」と言ってくれれば手がかりを出しますよ。")
 
 
 def main() -> None:

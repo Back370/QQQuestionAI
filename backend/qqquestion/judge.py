@@ -9,9 +9,9 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Iterator, Sequence
 
-from .llm import StructuredLLM
+from .llm import StreamEvent, StructuredLLM, stream_generate
 from .models import Judgement, Question
 from .textutil import normalize
 
@@ -83,25 +83,42 @@ def _merge_with_previous(
     return judgement
 
 
-def judge_answer(
+def judge_answer_stream(
     llm: StructuredLLM,
     question: Question,
     answer: str,
     already_matched: Sequence[str] = (),
-) -> Judgement:
+) -> Iterator[StreamEvent]:
+    """判定をストリーミングする。
+
+    ("judgement_partial", {"reason": str}) を逐次 yield し、
+    最後に ("judgement", Judgement) を必ず1回 yield する。
+
+    reason は verdict が correct / partial と確定した部分に限って流す。
+    incorrect の理由には欠けた要点（＝答えの手がかり）が含まれるため、
+    UI が非表示にしている情報を途中経過でも漏らさない。
+    """
     if not answer.strip():
-        return Judgement(
-            verdict="incorrect",
-            matched_points=list(already_matched),
-            reason="解答が空です。",
+        yield (
+            "judgement",
+            Judgement(
+                verdict="incorrect",
+                matched_points=list(already_matched),
+                reason="解答が空です。",
+            ),
         )
+        return
 
     if _exact_match(question, answer):
-        return Judgement(
-            verdict="correct",
-            matched_points=list(question.accepted_points),
-            reason="許容解答と一致",
+        yield (
+            "judgement",
+            Judgement(
+                verdict="correct",
+                matched_points=list(question.accepted_points),
+                reason="許容解答と一致",
+            ),
         )
+        return
 
     already_note = ""
     if already_matched:
@@ -118,7 +135,20 @@ def judge_answer(
         f"{already_note}\n"
         f"学習者の解答: {answer}"
     )
-    judgement = llm.generate(Judgement, _SYSTEM, user, temperature=0.0)
+    judgement: Judgement | None = None
+    for name, payload in stream_generate(llm, Judgement, _SYSTEM, user, temperature=0.0):
+        if name == "final":
+            judgement = payload  # type: ignore[assignment]
+            continue
+        partial: dict = payload  # type: ignore[assignment]
+        reason = partial.get("reason")
+        if (
+            partial.get("verdict") in ("correct", "partial")
+            and isinstance(reason, str)
+            and reason
+        ):
+            yield ("judgement_partial", {"reason": reason})
+    assert judgement is not None
     if not judgement.reason.strip():
         # 判定理由の必須化（architecture.md §4.3）: 理由なしは再判定する
         judgement = llm.generate(
@@ -129,4 +159,16 @@ def judge_answer(
         )
     if question.accepted_points:
         judgement = _merge_with_previous(question, judgement, already_matched)
-    return judgement
+    yield ("judgement", judgement)
+
+
+def judge_answer(
+    llm: StructuredLLM,
+    question: Question,
+    answer: str,
+    already_matched: Sequence[str] = (),
+) -> Judgement:
+    for name, payload in judge_answer_stream(llm, question, answer, already_matched):
+        if name == "judgement":
+            return payload  # type: ignore[return-value]
+    raise AssertionError("judge_answer_stream が judgement を返しませんでした")

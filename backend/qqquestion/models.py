@@ -5,10 +5,26 @@ from __future__ import annotations
 import time
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 QuestionType = Literal["prerequisite", "implementation"]
 Verdict = Literal["correct", "partial", "incorrect"]
+
+
+class _CitedModel(BaseModel):
+    """citations を持つモデルの基底。出典URLの重複を順序を保って除去する。
+
+    知識ベースは1件の検索結果を複数チャンクに分割し、各チャンクが同じ
+    URLを引き継ぐため、LLM がチャンク単位でURLを列挙すると同一URLが並ぶ。
+    表示前にここで一括して重複を除く。
+    """
+
+    citations: list[str] = Field(default_factory=list)
+
+    @field_validator("citations")
+    @classmethod
+    def _dedupe_citations(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(value))
 
 
 class Question(BaseModel):
@@ -45,14 +61,12 @@ class Judgement(BaseModel):
     reason: str = ""
 
 
-class Hint(BaseModel):
+class Hint(_CitedModel):
     hint: str
-    citations: list[str] = Field(default_factory=list)
 
 
-class Explanation(BaseModel):
+class Explanation(_CitedModel):
     explanation: str
-    citations: list[str] = Field(default_factory=list)
 
 
 class Chunk(BaseModel):

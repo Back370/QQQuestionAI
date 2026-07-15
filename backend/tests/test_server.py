@@ -17,6 +17,7 @@ def client(tmp_path):
         kb=InMemoryKnowledgeBase(),
         data_dir=tmp_path,
         diff_provider=lambda repo: analyze(SAMPLE_DIFF if repo != "empty" else ""),
+        run_in_background=lambda task: task(),  # テストでは決定的に同期実行
     )
     return TestClient(create_app(deps))
 
@@ -69,6 +70,44 @@ def test_full_flow_via_api(client):
     )
 
 
+def test_incorrect_answer_hides_grading_points(client):
+    """未完了(不正解)の判定は accepted_points 由来の要点を漏らさない。
+
+    matched_points / missing_points は正解の骨子そのものなので、問題が
+    終わるまではクライアントへ返さない（answer/stream の途中経過抑止と同方針）。
+    """
+    session_id = _start(client)
+    response = client.post(
+        f"/quiz/{session_id}/answer", json={"answer": "全く関係のない答え"}
+    ).json()
+    assert response["judgement"]["verdict"] == "incorrect"
+    assert response["question_done"] is False
+    assert response.get("model_answer") is None
+    assert response["judgement"]["missing_points"] == []
+    assert response["judgement"]["matched_points"] == []
+    assert response["judgement"]["reason"] == ""
+
+
+def test_partial_answer_hides_points_but_keeps_feedback(client):
+    """部分正解でも要点リストは伏せる。
+
+    q1 の設問文自体が「再帰結合」を含む（設問がその語の使用を要求している）
+    ため、漏洩チェックは設問文ではなく judgement オブジェクトに限定する。
+    """
+    session_id = _start(client)
+    response = client.post(
+        f"/quiz/{session_id}/answer",
+        json={"answer": "隠れ層が再帰結合を持つ点が違います"},
+    ).json()
+    assert response["judgement"]["verdict"] == "partial"
+    assert response["question_done"] is False
+    assert response["judgement"]["missing_points"] == []
+    assert response["judgement"]["matched_points"] == []
+    accepted_points = ["再帰結合", "前の時刻の隠れ状態", "系列・文脈の保持"]
+    judgement_serialized = str(response["judgement"])
+    assert not any(point in judgement_serialized for point in accepted_points)
+
+
 def test_hint_and_giveup_via_api(client):
     session_id = _start(client)
     hint = client.post(f"/quiz/{session_id}/hint").json()["hint"]
@@ -84,6 +123,71 @@ def test_pending_claims_once(client):
     first = client.get("/quiz/pending").json()["sessions"]
     assert [s["session_id"] for s in first] == [session_id]
     assert client.get("/quiz/pending").json()["sessions"] == []  # 二重表示しない
+
+
+def _start_in(client, repo_path: str) -> str:
+    response = client.post("/quiz/start", json={"repo_path": repo_path})
+    assert response.status_code == 200
+    return response.json()["session_id"]
+
+
+def test_pending_routes_to_matching_workspace(client, tmp_path):
+    """コミットが走ったリポジトリのワークスペースにだけクイズが出る。"""
+    repo = tmp_path / "repoA"
+    repo.mkdir()
+    other = tmp_path / "repoB"
+    other.mkdir()
+    session_id = _start_in(client, str(repo))
+
+    # 別リポジトリを開いたウィンドウ（repoB）は拾わない
+    assert (
+        client.get("/quiz/pending", params={"workspace": str(other)}).json()["sessions"]
+        == []
+    )
+    # コミット元リポジトリを開いたウィンドウ（repoA）が拾う
+    claimed = client.get("/quiz/pending", params={"workspace": str(repo)}).json()[
+        "sessions"
+    ]
+    assert [s["session_id"] for s in claimed] == [session_id]
+
+
+def test_pending_matches_subdirectory_commit(client, tmp_path):
+    """サブディレクトリで commit しても、リポジトリを開いたウィンドウが拾う。"""
+    repo = tmp_path / "repo"
+    subdir = repo / "pkg"
+    subdir.mkdir(parents=True)
+    session_id = _start_in(client, str(subdir))  # pwd がサブディレクトリ
+
+    claimed = client.get("/quiz/pending", params={"workspace": str(repo)}).json()[
+        "sessions"
+    ]
+    assert [s["session_id"] for s in claimed] == [session_id]
+
+
+def test_pending_grace_fallback_when_no_window_matches(client, tmp_path, monkeypatch):
+    """どのウィンドウのワークスペースにも一致しなければ、猶予後に誰でも拾う。"""
+    import qqquestion.server as server
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    session_id = _start_in(client, str(repo))
+
+    # 猶予内は担当外ウィンドウには出さない（取りこぼしを恐れて即出ししない）
+    assert (
+        client.get("/quiz/pending", params={"workspace": str(unrelated)}).json()[
+            "sessions"
+        ]
+        == []
+    )
+
+    # 猶予を過ぎたら保険としてどのウィンドウでも拾える
+    monkeypatch.setattr(server, "PENDING_GRACE_SECONDS", -1.0)
+    claimed = client.get("/quiz/pending", params={"workspace": str(unrelated)}).json()[
+        "sessions"
+    ]
+    assert [s["session_id"] for s in claimed] == [session_id]
 
 
 def test_abort_via_api(client):
