@@ -241,6 +241,27 @@ def test_start_fail_open_via_api(tmp_path):
     question = client.get(f"/quiz/{session_id}/question").json()
     assert question["question"] is None
     assert question["error"]
+    # レポートは「completed だが 0 問」= スキップと見分けられる情報を返す。
+    # UI/フックはこれで「完走」と「出題失敗スキップ」を区別する（誤って
+    # 「完走。コミット続行」と表示していたのが本バグの原因）。
+    report = client.get(f"/quiz/{session_id}/report").json()
+    assert report["status"] == "completed"
+    assert report["report"]["attempted"] == 0
+    assert report["report"]["completed"] is True
+
+
+def test_report_endpoint_marks_aborted(tmp_path):
+    """中断セッションのレポートは status=aborted・completed=False を返す。
+
+    UI がこれを「完走。コミット続行」と表示すると実際の挙動（コミット中止）と
+    正反対になるため、見分けられることを保証する。
+    """
+    client = TestClient(create_app(_deps(tmp_path, build_demo_llm())))
+    session_id = client.post("/quiz/start", json={"repo_path": "."}).json()["session_id"]
+    client.post(f"/quiz/{session_id}/abort")
+    report = client.get(f"/quiz/{session_id}/report").json()
+    assert report["status"] == "aborted"
+    assert report["report"]["completed"] is False
 
 
 def test_first_question_shows_while_rest_loads_in_background(tmp_path):

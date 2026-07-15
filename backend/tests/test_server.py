@@ -125,6 +125,71 @@ def test_pending_claims_once(client):
     assert client.get("/quiz/pending").json()["sessions"] == []  # 二重表示しない
 
 
+def _start_in(client, repo_path: str) -> str:
+    response = client.post("/quiz/start", json={"repo_path": repo_path})
+    assert response.status_code == 200
+    return response.json()["session_id"]
+
+
+def test_pending_routes_to_matching_workspace(client, tmp_path):
+    """コミットが走ったリポジトリのワークスペースにだけクイズが出る。"""
+    repo = tmp_path / "repoA"
+    repo.mkdir()
+    other = tmp_path / "repoB"
+    other.mkdir()
+    session_id = _start_in(client, str(repo))
+
+    # 別リポジトリを開いたウィンドウ（repoB）は拾わない
+    assert (
+        client.get("/quiz/pending", params={"workspace": str(other)}).json()["sessions"]
+        == []
+    )
+    # コミット元リポジトリを開いたウィンドウ（repoA）が拾う
+    claimed = client.get("/quiz/pending", params={"workspace": str(repo)}).json()[
+        "sessions"
+    ]
+    assert [s["session_id"] for s in claimed] == [session_id]
+
+
+def test_pending_matches_subdirectory_commit(client, tmp_path):
+    """サブディレクトリで commit しても、リポジトリを開いたウィンドウが拾う。"""
+    repo = tmp_path / "repo"
+    subdir = repo / "pkg"
+    subdir.mkdir(parents=True)
+    session_id = _start_in(client, str(subdir))  # pwd がサブディレクトリ
+
+    claimed = client.get("/quiz/pending", params={"workspace": str(repo)}).json()[
+        "sessions"
+    ]
+    assert [s["session_id"] for s in claimed] == [session_id]
+
+
+def test_pending_grace_fallback_when_no_window_matches(client, tmp_path, monkeypatch):
+    """どのウィンドウのワークスペースにも一致しなければ、猶予後に誰でも拾う。"""
+    import qqquestion.server as server
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    session_id = _start_in(client, str(repo))
+
+    # 猶予内は担当外ウィンドウには出さない（取りこぼしを恐れて即出ししない）
+    assert (
+        client.get("/quiz/pending", params={"workspace": str(unrelated)}).json()[
+            "sessions"
+        ]
+        == []
+    )
+
+    # 猶予を過ぎたら保険としてどのウィンドウでも拾える
+    monkeypatch.setattr(server, "PENDING_GRACE_SECONDS", -1.0)
+    claimed = client.get("/quiz/pending", params={"workspace": str(unrelated)}).json()[
+        "sessions"
+    ]
+    assert [s["session_id"] for s in claimed] == [session_id]
+
+
 def test_abort_via_api(client):
     session_id = _start(client)
     assert client.post(f"/quiz/{session_id}/abort").json()["status"] == "aborted"

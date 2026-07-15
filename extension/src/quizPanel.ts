@@ -69,13 +69,16 @@ export class QuizPanel {
         this.post({ type: "preparing" });
         setTimeout(() => void this.loadQuestion(), QUESTION_POLL_MS);
       } else {
+        // 問題が1問も出ないまま終端に達した。status とレポートの attempted で
+        // 「生成失敗によるスキップ」か「中断」かを見分けて正しく伝える
+        // （question=null を一律「完走」と表示していたのが誤表示の原因）。
         if (body.error) {
           this.post({
             type: "error",
             message: "問題の生成に失敗したためチェックをスキップします: " + body.error,
           });
         }
-        await this.completeSession();
+        await this.completeSession(body.status);
       }
     } catch (error) {
       this.post({ type: "load_error", message: String(error) });
@@ -168,18 +171,28 @@ export class QuizPanel {
   private postResult(result: AnswerResponse): void {
     this.post({ type: "result", result });
     if (result.status === "completed") {
-      void this.completeSession();
+      void this.completeSession(result.status);
     } else if (!result.next_question) {
       // 次の問題がまだ生成中 → 確定するまでポーリングして表示する
       void this.loadQuestion();
     }
   }
 
-  private async completeSession(): Promise<void> {
+  private async completeSession(status?: string): Promise<void> {
     this.finished = true;
     try {
       const report = await this.client.report(this.sessionId);
-      this.post({ type: "report", rendered: report.rendered });
+      // completed=true かつ attempted>0 のときだけ「完走→コミット続行」。
+      // attempted=0（生成失敗でスキップ）や aborted（中断→コミット中止）を
+      // 「完走」と表示していたのが、リザルトが最初に出て見えた誤表示の元。
+      const sessionStatus = status ?? report.status;
+      const outcome: "completed" | "skipped" | "aborted" =
+        sessionStatus === "aborted"
+          ? "aborted"
+          : report.attempted > 0 && report.completed
+            ? "completed"
+            : "skipped";
+      this.post({ type: "report", rendered: report.rendered, outcome });
     } catch (error) {
       this.post({ type: "error", message: String(error) });
     }
@@ -375,7 +388,16 @@ function renderHtml(): string {
       setBusy(false);
     } else if (message.type === "report") {
       el("question-area").style.display = "none";
-      addEntry("correct", message.rendered + "\\n理解度チェック完走。コミットを続行します。");
+      if (message.outcome === "aborted") {
+        addEntry("incorrect", message.rendered
+          + "\\n理解度チェックが中断されました。コミットは中止されます。");
+      } else if (message.outcome === "skipped") {
+        addEntry("partial", message.rendered
+          + "\\n出題できなかったため理解度チェックをスキップしました。コミットは続行します。");
+      } else {
+        addEntry("correct", message.rendered
+          + "\\n理解度チェック完走。コミットを続行します。");
+      }
     } else if (message.type === "error") {
       addEntry("incorrect", "エラー: " + message.message);
       liveReason = null;

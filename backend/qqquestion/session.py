@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -30,6 +31,8 @@ from .question_gen import (
     generate_first_question,
     generate_remaining_questions_stream,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -68,6 +71,7 @@ class QuizSession:
         history_store: HistoryStore | None = None,
         session_id: str | None = None,
         defer_questions: bool = False,
+        repo_path: str | None = None,
     ):
         self.id = session_id or uuid.uuid4().hex[:12]
         self._llm = llm
@@ -75,6 +79,9 @@ class QuizSession:
         self._history_store = history_store
         self._learner = learner_state or LearnerState()
         self.diff_ctx = diff_ctx
+        # コミットが走ったリポジトリの絶対パス。/quiz/pending が「どのVSCode
+        # ウィンドウにクイズを出すか」をワークスペースと突き合わせて決めるのに使う
+        self.repo_path = repo_path
         self.status = "in_progress"  # in_progress | completed | aborted
         self.error: str | None = None  # 出題生成に失敗したときのメッセージ
 
@@ -110,6 +117,9 @@ class QuizSession:
             )
             self._states.append(self._make_state(question))
         except Exception as error:
+            # 原因（元例外の連鎖・トレースバック）をログに残す。UI に出る
+            # self.error は分類済みメッセージで、生の失敗理由はここでしか追えない
+            logger.exception("第1問の生成に失敗しました: session=%s", self.id)
             self._preparing = False
             if not fail_open:
                 raise
@@ -137,6 +147,9 @@ class QuizSession:
                     return  # 準備中にパネルが閉じられた等
                 self._states.append(self._make_state(question))
         except Exception as error:
+            logger.exception(
+                "残り問題の生成に失敗しました: session=%s 確定済み=%d問", self.id, len(self._states)
+            )
             if not fail_open:
                 raise
             self.error = str(error)  # 確定済みの問題だけで続行

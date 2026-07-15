@@ -9,10 +9,13 @@ FakeLLM で全ロジックが動くようにする。
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Iterator, Protocol, TypeVar
 
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -140,6 +143,13 @@ class GeminiLLM:
                 [SystemMessage(content=system), HumanMessage(content=user)]
             )
         except Exception as error:
+            # UI には分類済みメッセージしか出ないため、生のエラーをログに残す
+            logger.warning(
+                "LLM呼び出しに失敗: model=%s schema=%s error=%r",
+                self._model_name,
+                schema.__name__,
+                error,
+            )
             raise LLMUnavailableError(_classify_llm_error(error)) from error
         if isinstance(result, dict):
             result = schema.model_validate(result)
@@ -175,7 +185,18 @@ class GeminiLLM:
             # API の利用不能はフォールバックしても直らないので即座に伝える。
             # それ以外（thinking_budget 非対応など）は通常経路で作り直す。
             if _is_unavailable_error(error):
+                logger.warning(
+                    "LLM呼び出し(fast)に失敗: model=%s schema=%s error=%r",
+                    self._model_name,
+                    schema.__name__,
+                    error,
+                )
                 raise LLMUnavailableError(_classify_llm_error(error)) from error
+            logger.info(
+                "fast生成に失敗したため通常生成へフォールバック: model=%s error=%r",
+                self._model_name,
+                error,
+            )
             return self.generate(schema, system, user, temperature=temperature)
 
     def generate_stream(
@@ -213,7 +234,14 @@ class GeminiLLM:
                     last_partial = partial
                     yield ("partial", partial)
             final = schema.model_validate(json.loads(_strip_fences(buffer)))
-        except Exception:
+        except Exception as error:
+            logger.info(
+                "ストリーミング生成に失敗したため非ストリーム生成へフォールバック: "
+                "model=%s schema=%s error=%r",
+                self._model_name,
+                schema.__name__,
+                error,
+            )
             final = None
         if final is None:
             # generate() はタイムアウト等を LLMUnavailableError に変換して投げる

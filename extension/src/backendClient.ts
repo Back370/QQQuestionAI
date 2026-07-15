@@ -104,8 +104,13 @@ export class BackendClient {
     }
   }
 
-  pending(): Promise<{ sessions: PendingSession[] }> {
-    return this.request("/quiz/pending");
+  // このウィンドウのワークスペースパスを渡し、コミットが走ったリポジトリと
+  // 一致するセッションだけ受け取る（別ウィンドウでパネルが開くのを防ぐ）。
+  pending(workspaces: string[] = []): Promise<{ sessions: PendingSession[] }> {
+    const query = workspaces
+      .map((w) => `workspace=${encodeURIComponent(w)}`)
+      .join("&");
+    return this.request(`/quiz/pending${query ? `?${query}` : ""}`);
   }
 
   question(sessionId: string): Promise<{
@@ -196,7 +201,21 @@ export class BackendClient {
     return this.request(`/quiz/${sessionId}/abort`, { method: "POST" });
   }
 
-  report(sessionId: string): Promise<{ rendered: string }> {
-    return this.request(`/quiz/${sessionId}/report`, undefined, LLM_TIMEOUT_MS);
+  report(sessionId: string): Promise<{
+    rendered: string;
+    status: string;
+    attempted: number;
+    completed: boolean;
+  }> {
+    return this.request<{
+      rendered: string;
+      status: string;
+      report: { attempted: number; completed: boolean };
+    }>(`/quiz/${sessionId}/report`, undefined, LLM_TIMEOUT_MS).then((body) => ({
+      rendered: body.rendered,
+      status: body.status,
+      attempted: body.report.attempted,
+      completed: body.report.completed,
+    }));
   }
 }

@@ -77,7 +77,13 @@ function startPolling(client: BackendClient): void {
       return;
     }
     try {
-      const body = await client.pending();
+      // 自ウィンドウのワークスペースを渡す。バックエンドはコミットが走った
+      // リポジトリと一致するセッションだけ返すので、別ウィンドウにパネルが
+      // 開くことがなくなる
+      const workspaces = (vscode.workspace.workspaceFolders ?? []).map(
+        (folder) => folder.uri.fsPath
+      );
+      const body = await client.pending(workspaces);
       for (const session of body.sessions) {
         output.appendLine(
           `セッション検知: ${session.session_id} (${session.files.join(", ")})`
