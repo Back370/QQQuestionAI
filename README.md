@@ -53,3 +53,11 @@ AIを活用したアプリケーション開発用のテンプレートリポジ
 ## ライセンス
 
 [MIT](./LICENSE)
+
+このリポジトリは MIT ライセンスのテンプレートリポジトリ（Copyright (c) 2026 Kaito SAKAO）から作られている。
+`.claude/skills/`・`AGENTS.md`・`scripts/verify_safety_net.py`・`.github/workflows/verify-template.yml`
+などの安全網部分がテンプレート由来で、MIT の条件に従って原著作権表示を [LICENSE](./LICENSE) に残している。
+QQQuestionAI 自体（`backend/`・`extension/`）の著作権は QQQuestionAI contributors にある。
+
+配布する VSCode 拡張（.vsix）にはテンプレート由来のコードを同梱していないため、
+[extension/LICENSE](./extension/LICENSE) は QQQuestionAI contributors のみを表示している。

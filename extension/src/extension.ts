@@ -5,6 +5,7 @@
 // - Gemini の API キーを SecretStorage で預かり、バックエンドへ環境変数で渡す
 
 import * as childProcess from "child_process";
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -18,17 +19,10 @@ const POLL_INTERVAL_MS = 1500;
 // そこで拡張が預かり、起動時に環境変数として渡す。
 const API_KEY_SECRET = "qqquestion.googleApiKey";
 
-// 拡張に同梱する Python バックエンドが必要とするコア依存。すべて遅延 import を
-// 前提にしているので、これだけあれば FakeLLM デモも実 Gemini も起動できる
-// （chromadb/ddgs による RAG は任意。無くてもフォールバックする）。
-const PY_DEPS = [
-  "fastapi>=0.110",
-  "uvicorn>=0.29",
-  "pydantic>=2.7",
-  "httpx>=0.27",
-  "langchain-core>=0.2",
-  "langchain-google-genai>=1.0",
-];
+// 拡張に同梱する Python バックエンドが必要とするコア依存。バージョンは
+// bundled/requirements.txt（backend/requirements.txt の複製）に == で固定してある。
+// すべて遅延 import を前提にしているので、これだけあれば FakeLLM デモも実 Gemini も
+// 起動できる（chromadb/ddgs による RAG は任意。無くてもフォールバックする）。
 
 let backendProcess: childProcess.ChildProcess | undefined;
 let pollTimer: NodeJS.Timeout | undefined;
@@ -101,20 +95,28 @@ function systemPython(): string {
   return configured || (process.platform === "win32" ? "python" : "python3");
 }
 
-// 拡張が管理する専用 venv を用意する（初回のみ venv 作成 + 依存 pip install）。
+// 拡張が管理する専用 venv を用意する（venv 作成 + 依存 pip install）。
 // clone 不要でバックエンドを動かすための土台。venv は globalStorage に置くので
 // 拡張の更新・再インストールでも残り、書き込み可能。
 async function bootstrapVenv(): Promise<string> {
   const venvDir = path.join(globalStoragePath, "venv");
   const py = venvPython(venvDir);
   const marker = path.join(venvDir, ".deps-installed");
-  if (fs.existsSync(py) && fs.existsSync(marker)) {
+  const requirements = path.join(bundledBackendDir(), "requirements.txt");
+  // requirements.txt の内容そのものを指紋として記録し、変わったときだけ入れ直す。
+  // 「一度入れたら二度と入れ直さない」だと、依存の脆弱性を直して publish しても
+  // 既存利用者の venv には古いバージョンが残り続け、修正が永久に届かない。
+  const fingerprint = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(requirements))
+    .digest("hex");
+  if (fs.existsSync(py) && readIfExists(marker) === fingerprint) {
     return py;
   }
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "QQQuestionAI: 初回セットアップ（Python 環境を準備中）",
+      title: "QQQuestionAI: Python 環境を準備中（初回セットアップ / 依存の更新）",
       cancellable: false,
     },
     async () => {
@@ -123,11 +125,19 @@ async function bootstrapVenv(): Promise<string> {
         await run(systemPython(), ["-m", "venv", venvDir]);
       }
       await run(py, ["-m", "pip", "install", "--upgrade", "pip"]);
-      await run(py, ["-m", "pip", "install", ...PY_DEPS]);
-      fs.writeFileSync(marker, new Date().toISOString());
+      await run(py, ["-m", "pip", "install", "-r", requirements]);
+      fs.writeFileSync(marker, fingerprint);
     }
   );
   return py;
+}
+
+function readIfExists(file: string): string | undefined {
+  try {
+    return fs.readFileSync(file, "utf8").trim();
+  } catch {
+    return undefined;
+  }
 }
 
 // バックエンド起動に使う Python を決める。
