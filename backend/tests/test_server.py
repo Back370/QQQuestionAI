@@ -118,11 +118,34 @@ def test_hint_and_giveup_via_api(client):
     assert response["next_question"]["number"] == 2
 
 
-def test_pending_claims_once(client):
+def test_pending_is_read_only_until_claimed(client):
+    """GET /quiz/pending は副作用なし。claim するまで何度でも同じものを返す。
+
+    旧実装は GET で claim していたため、claim 後に応答を落とすとセッションが
+    誰にも配られず、タイムアウトの無いフックが無限待機してコミットが固まった。
+    読み取り専用にしたことで、応答を取りこぼしても次の周回で再掲される。
+    """
     session_id = _start(client)
     first = client.get("/quiz/pending").json()["sessions"]
     assert [s["session_id"] for s in first] == [session_id]
-    assert client.get("/quiz/pending").json()["sessions"] == []  # 二重表示しない
+    # もう一度読んでも消えない（応答取りこぼしからの回復に必要）
+    again = client.get("/quiz/pending").json()["sessions"]
+    assert [s["session_id"] for s in again] == [session_id]
+
+
+def test_claim_removes_from_pending_and_is_first_wins(client):
+    session_id = _start(client)
+
+    won = client.post(f"/quiz/{session_id}/claim").json()
+    assert won == {"ok": True}
+    # claim 後は一覧から消える（このパネルが所有した）
+    assert client.get("/quiz/pending").json()["sessions"] == []
+    # 二人目の claim は先着に負ける（別ウィンドウは abort せず閉じるための合図）
+    assert client.post(f"/quiz/{session_id}/claim").json() == {"ok": False}
+
+
+def test_claim_unknown_session_is_404(client):
+    assert client.post("/quiz/nope/claim").status_code == 404
 
 
 def _start_in(client, repo_path: str) -> str:

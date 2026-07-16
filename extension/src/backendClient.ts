@@ -143,6 +143,17 @@ export class BackendClient {
     );
   }
 
+  // パネルが表示準備を終えた後に所有権を取る。GET /quiz/pending は読み取り専用で
+  // 何度でも同じセッションを返すため、実際に開けたパネルがこの POST で claim して
+  // 初めて一覧から外れる。ok=false は別ウィンドウが先に所有した合図。
+  claim(sessionId: string): Promise<{ ok: boolean }> {
+    return this.request(
+      `/quiz/${sessionId}/claim`,
+      { method: "POST" },
+      POLL_TIMEOUT_MS
+    );
+  }
+
   question(sessionId: string): Promise<{
     question: PublicQuestion | null;
     status: string;

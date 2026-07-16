@@ -228,6 +228,10 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
         # 生成前にセッションを公開する: 拡張の /quiz/pending ポーリングが即座に
         # 拾ってパネルを開き、「生成中」を表示できる
         deps.sessions[session.id] = session
+        # 猶予フォールバックの起点は「生成時刻」で固定する。/quiz/pending を
+        # 読み取り専用に保つため、GET 側では pending_since を書き込まない
+        if session.origin == "hook":
+            deps.pending_since[session.id] = time.monotonic()
         # 第1問だけ同期生成して即出題する。残り4問と知識ベース構築（Web検索）は
         # バックグラウンドに回し、第1問の解答中に進める
         session.prepare_first(fail_open=True)
@@ -270,7 +274,14 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
 
     @app.get("/quiz/pending")
     def pending(workspace: list[str] = Query(default=[])):
-        """パネルを開いてほしいセッション一覧。返したものは claimed 扱いにする。
+        """パネルを開いてほしいセッション一覧を返す（読み取り専用）。
+
+        **副作用なし。** 一覧に載せても claim しない。実際に表示できたパネルが
+        POST /quiz/{id}/claim で所有権を取るまで、同じセッションを何度でも返す。
+        こうすることで応答を取りこぼしてもコミットが固まらない（旧実装は GET で
+        claim していたため、claim 後に応答を落とすとセッションが誰にも配られず、
+        タイムアウトの無いフックが in_progress のまま無限待機した）。同一
+        セッションが連続で返っても QuizPanel.show が sessionId で重複排除する。
 
         返すのは origin="hook" のセッションだけ。フックは curl のシェル
         スクリプトで自前の UI を持たず、拡張にパネルを開いてもらう以外に
@@ -282,23 +293,19 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
         走ったリポジトリ（session.repo_path）を、ポーリング元ウィンドウの
         ワークスペース（workspace クエリ）と突き合わせ、担当ウィンドウにだけ
         返す。これで別ウィンドウにクイズパネルが開く問題を防ぐ。
-        workspace 未指定（旧拡張）のときは従来どおり即 claim する。
+        workspace 未指定（旧拡張）のときは全ウィンドウに返す。
         """
         found: list[dict] = []
         workspaces = [_normalize_path(w) for w in workspace]
         now = time.monotonic()
 
-        def claim(session: QuizSession) -> None:
-            deps.claimed.add(session.id)
-            deps.pending_since.pop(session.id, None)
-            found.append(
-                {
-                    "session_id": session.id,
-                    "topics": session.diff_ctx.topics,
-                    "files": session.diff_ctx.files,
-                    "total": session.total,
-                }
-            )
+        def as_entry(session: QuizSession) -> dict:
+            return {
+                "session_id": session.id,
+                "topics": session.diff_ctx.topics,
+                "files": session.diff_ctx.files,
+                "total": session.total,
+            }
 
         for session in deps.sessions.values():
             if session.status != "in_progress" or session.id in deps.claimed:
@@ -306,14 +313,31 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
             if session.origin != "hook":
                 continue  # cli / ui は自前の UI で出題済み。パネルを開かない
             if not workspaces or _repo_matches_workspaces(session.repo_path, workspaces):
-                claim(session)
+                found.append(as_entry(session))
                 continue
             # このウィンドウの担当ではない。担当ウィンドウが猶予内に拾えなければ
-            # （パス不一致・対象リポジトリが未オープン等）取りこぼし防止で誰でも拾う
-            first_seen = deps.pending_since.setdefault(session.id, now)
+            # （パス不一致・対象リポジトリが未オープン等）取りこぼし防止で誰でも拾う。
+            # 起点時刻は start() で記録済みなので、ここでは読むだけ（GET は副作用なし）
+            first_seen = deps.pending_since.get(session.id, now)
             if now - first_seen >= PENDING_GRACE_SECONDS:
-                claim(session)
+                found.append(as_entry(session))
         return {"sessions": found}
+
+    @app.post("/quiz/{session_id}/claim")
+    def claim(session_id: str):
+        """パネルが表示準備完了後に所有権を取る。冪等かつ先着。
+
+        ポーリングの GET から claim を切り離したことで、この POST が「どの
+        パネルがこのセッションを出すか」を確定させる唯一の地点になる。
+        ok=true: この呼び出しで未claim→claimed に遷移（このパネルが所有）。
+        ok=false: 既に別パネル（別ウィンドウ）が所有済み。呼び出し側はパネルを
+        閉じるが、その際に abort してはいけない（所有者のコミットを巻き込むため）。
+        """
+        _session_or_404(deps, session_id)
+        won = session_id not in deps.claimed
+        deps.claimed.add(session_id)
+        deps.pending_since.pop(session_id, None)
+        return {"ok": won}
 
     @app.get("/quiz/{session_id}/status")
     def status(session_id: str):

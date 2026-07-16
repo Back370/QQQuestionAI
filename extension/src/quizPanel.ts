@@ -12,6 +12,10 @@ export class QuizPanel {
   private readonly panel: vscode.WebviewPanel;
   private finished = false;
   private disposed = false;
+  private claimed = false;
+  // 別ウィンドウが先にこのセッションを所有していた。閉じるときに abort しては
+  // いけない（所有者ウィンドウのコミットを巻き込んで中止させてしまう）
+  private claimLost = false;
 
   static show(client: BackendClient, sessionId: string): void {
     if (QuizPanel.panels.has(sessionId)) {
@@ -39,7 +43,7 @@ export class QuizPanel {
     this.panel.onDidDispose(async () => {
       this.disposed = true;
       QuizPanel.panels.delete(this.sessionId);
-      if (!this.finished) {
+      if (!this.finished && !this.claimLost) {
         try {
           await this.client.abort(this.sessionId);
         } catch {
@@ -54,6 +58,35 @@ export class QuizPanel {
 
   private post(message: unknown): void {
     void this.panel.webview.postMessage(message);
+  }
+
+  // 表示準備が整ってから所有権を取る。戻り値 true なら出題を続けてよい。
+  // 一度成功したら再要求（reload）では claim し直さない。
+  private async claimOwnership(): Promise<boolean> {
+    if (this.claimed) {
+      return true;
+    }
+    try {
+      const { ok } = await this.client.claim(this.sessionId);
+      if (!ok) {
+        // 別ウィンドウが先に所有。abort せずに静かに閉じる（claimLost）
+        this.claimLost = true;
+        this.post({
+          type: "error",
+          message: "このチェックは別のウィンドウで開いています。",
+        });
+        this.panel.dispose();
+        return false;
+      }
+      this.claimed = true;
+      return true;
+    } catch {
+      // claim に失敗（バックエンド一時不通等）。ここで止めるとフックが待ち続ける
+      // ので、所有できたものとみなして出題を進める（fail-open）。最悪でも同一
+      // ワークスペースを複数ウィンドウで開いた稀なケースで二重表示になるだけ
+      this.claimed = true;
+      return true;
+    }
   }
 
   private async loadQuestion(): Promise<void> {
@@ -90,6 +123,9 @@ export class QuizPanel {
       switch (message.type) {
         case "ready":
         case "reload": {
+          if (!(await this.claimOwnership())) {
+            break; // 別ウィンドウが所有。claimOwnership がパネルを閉じる
+          }
           await this.loadQuestion();
           break;
         }
