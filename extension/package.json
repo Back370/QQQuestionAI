@@ -2,7 +2,7 @@
   "name": "qqquestion-ai-v",
   "displayName": "QQQuestionAIVSCode",
   "description": "コミット前に差分から5問出題し、コードの理解度を確認する学習支援AI。答えは教えず、ヒントだけを提示します。",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "Back-Room",
   "engines": {
     "vscode": "^1.85.0"
