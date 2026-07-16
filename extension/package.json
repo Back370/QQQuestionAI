@@ -2,7 +2,7 @@
   "name": "qqquestion-ai-v",
   "displayName": "QQQuestionAIVSCode",
   "description": "コミット前に差分から5問出題し、コードの理解度を確認する学習支援AI。答えは教えず、ヒントだけを提示します。",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "Back-Room",
   "engines": {
     "vscode": "^1.85.0"
@@ -21,16 +21,24 @@
   "contributes": {
     "commands": [
       {
+        "command": "qqquestion.startQuiz",
+        "title": "QQQuestionAI: クイズを開始（ステージ済み差分から出題）"
+      },
+      {
         "command": "qqquestion.startBackend",
         "title": "QQQuestionAI: バックエンドを起動"
       },
       {
         "command": "qqquestion.installHook",
-        "title": "QQQuestionAI: pre-commit フックをインストール"
+        "title": "QQQuestionAI: pre-commit フックをインストール（任意・コミットをゲートする）"
       },
       {
         "command": "qqquestion.setApiKey",
         "title": "QQQuestionAI: API キーを設定"
+      },
+      {
+        "command": "qqquestion.setupTerminalQuiz",
+        "title": "QQQuestionAI: ターミナルの quiz コマンドを設定"
       }
     ],
     "configuration": {

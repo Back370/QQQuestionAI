@@ -329,6 +329,183 @@ function startPolling(client: BackendClient): void {
   }, POLL_INTERVAL_MS);
 }
 
+// ターミナル用 `quiz` コマンドの置き場所（このディレクトリだけを PATH に足す。
+// venv/bin をまるごと足すと利用者の python/pip を覆い隠してしまうため）。
+function quizBinDir(): string {
+  return path.join(globalStoragePath, "bin");
+}
+
+// ターミナルから使う `quiz` を生成する。
+//
+// 中身は remote_cli（起動済みバックエンドへの HTTP クライアント）を呼ぶだけ。
+// ローカルで LLM を組み立てる cli ではなく remote_cli を使うのは、API キーが
+// VSCode の SecretStorage にあり、ターミナル側から読めないため。バックエンドに
+// 実行を委譲することで、この shim に秘密を一切埋め込まずに済む。
+async function ensureQuizShim(): Promise<string | undefined> {
+  const backendDir = findBackendDir();
+  if (!backendDir) {
+    return undefined;
+  }
+  let python: string;
+  try {
+    python = await resolvePython(backendDir);
+  } catch {
+    return undefined; // Python 未準備。startBackend 側で案内済み
+  }
+  const binDir = quizBinDir();
+  fs.mkdirSync(binDir, { recursive: true });
+  const port = String(config().get<number>("port", 8756));
+  const dataDir = path.join(globalStoragePath, "data");
+
+  if (process.platform === "win32") {
+    const cmdPath = path.join(binDir, "quiz.cmd");
+    fs.writeFileSync(
+      cmdPath,
+      [
+        "@echo off",
+        "REM QQQuestionAI: ターミナル用 quiz コマンド（拡張が自動生成。秘密は含まない）",
+        `set "PYTHONPATH=${backendDir};%PYTHONPATH%"`,
+        `if not defined QQQ_PORT set "QQQ_PORT=${port}"`,
+        `if not defined QQQ_DATA_DIR set "QQQ_DATA_DIR=${dataDir}"`,
+        `"${python}" -m qqquestion.remote_cli %*`,
+        "",
+      ].join("\r\n"),
+      "utf-8"
+    );
+    return binDir;
+  }
+
+  const shimPath = path.join(binDir, "quiz");
+  fs.writeFileSync(
+    shimPath,
+    [
+      "#!/bin/sh",
+      "# QQQuestionAI: ターミナル用 quiz コマンド（拡張が自動生成）。",
+      "# 起動済みバックエンドに HTTP でつなぐだけなので、API キー等の秘密は含まない。",
+      `PYTHONPATH="${backendDir}\${PYTHONPATH:+:$PYTHONPATH}" \\`,
+      `QQQ_PORT="\${QQQ_PORT:-${port}}" \\`,
+      `QQQ_DATA_DIR="\${QQQ_DATA_DIR:-${dataDir}}" \\`,
+      `exec "${python}" -m qqquestion.remote_cli "$@"`,
+      "",
+    ].join("\n"),
+    "utf-8"
+  );
+  fs.chmodSync(shimPath, 0o755);
+  return binDir;
+}
+
+// 統合ターミナルで `quiz` が使えるようにする（PATH に bin ディレクトリを追加）。
+async function registerQuizOnPath(context: vscode.ExtensionContext): Promise<void> {
+  const binDir = await ensureQuizShim();
+  if (!binDir) {
+    return;
+  }
+  const collection = context.environmentVariableCollection;
+  collection.description = "QQQuestionAI: ターミナルで quiz コマンドを使えるようにします";
+  collection.replace("QQQ_QUIZ_BIN", binDir);
+  collection.prepend("PATH", `${binDir}${path.delimiter}`);
+  output.appendLine(`quiz コマンドを用意しました: ${path.join(binDir, "quiz")}`);
+}
+
+// 外部ターミナル（VSCode の統合ターミナル以外）向けの導入案内。
+async function setupTerminalQuiz(): Promise<void> {
+  const binDir = await ensureQuizShim();
+  if (!binDir) {
+    void vscode.window.showErrorMessage(
+      "QQQuestionAI: quiz コマンドを用意できませんでした（出力パネル参照）"
+    );
+    output.show();
+    return;
+  }
+  const line = `export PATH="${binDir}:$PATH"`;
+  const choice = await vscode.window.showInformationMessage(
+    "QQQuestionAI: VSCode の統合ターミナルでは、そのまま quiz と打てば使えます。" +
+      "外部のターミナルでも使うには、下の行をシェル設定に追記してください。",
+    { modal: true, detail: line },
+    "行をコピー"
+  );
+  if (choice === "行をコピー") {
+    await vscode.env.clipboard.writeText(line);
+    void vscode.window.showInformationMessage("コピーしました。~/.zshrc 等に貼り付けてください");
+  }
+}
+
+// バックエンドが応答するまで待つ（起動直後は数秒かかる）。
+async function waitForHealth(client: BackendClient, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await client.health()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
+
+// クイズ対象のリポジトリを選ぶ。複数ワークスペースなら訊く。
+async function pickRepoPath(): Promise<string | undefined> {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length === 0) {
+    void vscode.window.showErrorMessage("QQQuestionAI: ワークスペースが開かれていません");
+    return undefined;
+  }
+  if (folders.length === 1) {
+    return folders[0].uri.fsPath;
+  }
+  const picked = await vscode.window.showQuickPick(
+    folders.map((folder) => ({ label: folder.name, description: folder.uri.fsPath })),
+    { title: "QQQuestionAI: どのリポジトリの差分から出題しますか？" }
+  );
+  return picked?.description;
+}
+
+// コマンド「クイズを開始」。git のコミットとは独立して動き、結果がコミットを
+// 左右することはない（全問正解してもコミットはしない）。
+async function startQuiz(client: BackendClient): Promise<void> {
+  const repoPath = await pickRepoPath();
+  if (!repoPath) {
+    return;
+  }
+  if (!(await client.health())) {
+    await startBackend(client);
+    if (!(await waitForHealth(client, 120_000))) {
+      output.show();
+      void vscode.window.showErrorMessage(
+        "QQQuestionAI: バックエンドを起動できませんでした（出力パネル参照）"
+      );
+      return;
+    }
+  }
+  try {
+    const body = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "QQQuestionAI: 差分から問題を生成中...",
+        cancellable: false,
+      },
+      () => client.start(repoPath)
+    );
+    if (body.error) {
+      output.appendLine(`出題時の警告: ${body.error}`);
+      void vscode.window.showWarningMessage(`QQQuestionAI: ${body.error}`);
+    }
+    output.appendLine(`クイズ開始: ${body.session_id} (${body.files.join(", ")})`);
+    QuizPanel.show(client, body.session_id);
+  } catch (error) {
+    const message = String(error);
+    // 400 = ステージ済み差分なし。ユーザーの操作で直せるので専用の案内にする
+    if (message.includes("HTTP 400")) {
+      void vscode.window.showWarningMessage(
+        "QQQuestionAI: ステージ済みの差分がありません。git add してから実行してください"
+      );
+      return;
+    }
+    output.appendLine(`クイズ開始に失敗: ${message}`);
+    output.show();
+    void vscode.window.showErrorMessage("QQQuestionAI: クイズを開始できませんでした（出力パネル参照）");
+  }
+}
+
 async function installHook(): Promise<void> {
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) {
@@ -373,13 +550,22 @@ export function activate(context: vscode.ExtensionContext): void {
   const client = new BackendClient(config().get<number>("port", 8756));
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("qqquestion.startQuiz", () => startQuiz(client)),
     vscode.commands.registerCommand("qqquestion.startBackend", () => startBackend(client)),
     vscode.commands.registerCommand("qqquestion.installHook", () => installHook()),
     vscode.commands.registerCommand("qqquestion.setApiKey", () => setApiKey(client)),
+    vscode.commands.registerCommand("qqquestion.setupTerminalQuiz", () => setupTerminalQuiz()),
+    // ポートを変えると shim に焼き込んだ値が古くなるため作り直す
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("qqquestion.port")) {
+        void registerQuizOnPath(context);
+      }
+    }),
     output
   );
 
   void startBackend(client);
+  void registerQuizOnPath(context);
   startPolling(client);
 }
 

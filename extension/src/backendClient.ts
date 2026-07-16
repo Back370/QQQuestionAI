@@ -104,6 +104,26 @@ export class BackendClient {
     }
   }
 
+  // クイズを開始する（コミットとは無関係。結果がコミットを左右することはない）。
+  // 第1問はサーバ側で同期生成されるため、LLM 相当の待ち時間を見込む。
+  start(repoPath: string): Promise<{
+    session_id: string;
+    topics: string[];
+    files: string[];
+    total: number;
+    error?: string | null;
+  }> {
+    return this.request(
+      "/quiz/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo_path: repoPath }),
+      },
+      LLM_TIMEOUT_MS
+    );
+  }
+
   // このウィンドウのワークスペースパスを渡し、コミットが走ったリポジトリと
   // 一致するセッションだけ受け取る（別ウィンドウでパネルが開くのを防ぐ）。
   pending(workspaces: string[] = []): Promise<{ sessions: PendingSession[] }> {

@@ -1,8 +1,20 @@
 #!/bin/sh
-# QQQuestionAI pre-commit フック（architecture.md §3 発動方法）。
-# QQQ_QUIZ=1 のとき（`git commit -q` ラッパー経由）だけ理解度チェックを発動する。
-# バックエンド未起動なら警告のみで素通しし、コミットを壊さない。
-# インストール: scripts/install_quiz_hook.sh を対象リポジトリで実行
+# QQQuestionAI pre-commit フック。任意の機能で、「コミット前に必ず問われる」
+# 強制力が欲しい人だけが入れる。 https://github.com/Back370/QQQuestionAI
+#
+# 【このファイルについて】
+# これは git の管理外 (.git/hooks/) に配置される実行体で、`git ls-files` に
+# 出てこないのが正常。このリポジトリに QQQuestionAI のソースを置く必要は無い。
+#
+# 実行時に必要なのは curl / git / python3 (JSON 整形用) だけ。
+# 出題を行うバックエンドは VSCode 拡張が別プロセスで起動する（拡張に同梱されて
+# いる）。このリポジトリ内の backend/ や scripts/ を参照することはない。
+#
+# 発動するのは `QQQ_QUIZ=1 git commit -m "..."` と明示したときだけ。素の
+# `git commit` や `git commit -q` には一切影響しない（-q は git 本来のフラグ）。
+# ふだんの理解度チェックはコミットと無関係に `quiz` コマンドで行う。
+#
+# バックエンド未起動なら警告のみで素通しし、コミットを壊さない（fail-open）。
 
 [ "$QQQ_QUIZ" = "1" ] || exit 0
 
@@ -11,7 +23,10 @@ BASE="http://127.0.0.1:${PORT}"
 
 if ! curl -s -m 2 "${BASE}/health" >/dev/null 2>&1; then
     echo "QQQuestionAI: バックエンド未起動のため理解度チェックをスキップします" >&2
-    echo "  (VSCode で拡張を起動するか、backend/ で python -m qqquestion.server を実行)" >&2
+    echo "  (コミットはこのまま続行します。これは異常ではありません)" >&2
+    echo "  出題するには、QQQuestionAI 拡張を入れた VSCode でこのリポジトリを" >&2
+    echo "  開いてください。拡張がバックエンドを自動起動します。" >&2
+    echo "  ※ このリポジトリに backend/ 等を置く必要はありません" >&2
     exit 0
 fi
 
@@ -55,7 +70,8 @@ while :; do
             ;;
         aborted)
             echo "QQQuestionAI: 理解度チェックが中断されました。コミットを中止します" >&2
-            echo "  (記録は保存済み。もう一度 git commit -q で再挑戦できます)" >&2
+            echo "  (記録は保存済み。quiz コマンドで再挑戦するか、もう一度" >&2
+            echo "   QQQ_QUIZ=1 git commit でやり直せます)" >&2
             exit 1
             ;;
         "")
