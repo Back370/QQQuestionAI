@@ -54,11 +54,17 @@ _DEF_RE = re.compile(r"^\+\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTI
 
 def get_staged_diff(repo_path: str = ".") -> str:
     """コミット対象（ステージ済み）の差分だけを取得する。"""
+    # encoding を明示しないと locale 依存になる（Windows 日本語環境では cp932）。
+    # git は UTF-8 で出すため、日本語コメントを含む差分が cp932 でデコードできず、
+    # Windows では読み取りスレッドが死んで stdout が黙って None になる。
+    # errors="replace" は Shift_JIS 等で保存されたファイルの差分でも落とさないため。
     result = subprocess.run(
         ["git", "diff", "--cached", "--no-color"],
         cwd=repo_path,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
     )
     return result.stdout
