@@ -2,6 +2,7 @@
 // - バックエンド (python -m qqquestion.server) を自動起動
 // - /quiz/pending をポーリングし、git commit -q 起点のセッションを Webview に表示
 // - pre-commit フックのインストールコマンドを提供
+// - Gemini の API キーを SecretStorage で預かり、バックエンドへ環境変数で渡す
 
 import * as childProcess from "child_process";
 import * as fs from "fs";
@@ -11,6 +12,11 @@ import { BackendClient } from "./backendClient";
 import { QuizPanel } from "./quizPanel";
 
 const POLL_INTERVAL_MS = 1500;
+
+// SecretStorage 上のキー名。GUI から起動した VSCode はシェルの環境変数を
+// 引き継がないため、~/.zshrc の export に頼るとキーがバックエンドに届かない。
+// そこで拡張が預かり、起動時に環境変数として渡す。
+const API_KEY_SECRET = "qqquestion.googleApiKey";
 
 // 拡張に同梱する Python バックエンドが必要とするコア依存。すべて遅延 import を
 // 前提にしているので、これだけあれば FakeLLM デモも実 Gemini も起動できる
@@ -30,6 +36,11 @@ let output: vscode.OutputChannel;
 // activate で設定。拡張の設置場所と、書き込み可能な永続ストレージ。
 let extensionPath = "";
 let globalStoragePath = "";
+let secrets: vscode.SecretStorage;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function config() {
   return vscode.workspace.getConfiguration("qqquestion");
@@ -169,6 +180,15 @@ async function startBackend(client: BackendClient): Promise<void> {
   if (config().get<boolean>("fakeLlm", false)) {
     env.QQQ_FAKE_LLM = "1";
   }
+  // 拡張が預かっているキーを優先する（コマンドで明示的に設定されたものなので、
+  // 引き継いだ環境変数より意図が新しい）。
+  const storedKey = await secrets.get(API_KEY_SECRET);
+  if (storedKey) {
+    env.GOOGLE_API_KEY = storedKey;
+  }
+  if (!env.QQQ_FAKE_LLM && !env.GOOGLE_API_KEY) {
+    promptForMissingApiKey(client);
+  }
   // 同梱ソースから起動する場合、cwd(=bundled) は拡張更新で消えるため、履歴や
   // ログの保存先を書き込み可能な永続ストレージに固定する。
   if (backendDir === bundledBackendDir()) {
@@ -187,6 +207,88 @@ async function startBackend(client: BackendClient): Promise<void> {
     backendProcess = undefined;
   });
   output.appendLine(`バックエンドを起動: ${python} -m qqquestion.server (cwd=${backendDir})`);
+}
+
+// キーが無いと問題を生成できず「すぐ完走」に見えるだけなので、その場で促す。
+function promptForMissingApiKey(client: BackendClient): void {
+  const setNow = "API キーを設定";
+  void vscode.window
+    .showWarningMessage(
+      "QQQuestionAI: Gemini の API キーが未設定のため、問題を生成できません",
+      setNow
+    )
+    .then((choice) => {
+      if (choice === setNow) {
+        void setApiKey(client);
+      }
+    });
+}
+
+async function setApiKey(client: BackendClient): Promise<void> {
+  const existing = await secrets.get(API_KEY_SECRET);
+  const input = await vscode.window.showInputBox({
+    title: "QQQuestionAI: Gemini の API キー",
+    prompt: existing
+      ? "新しいキーを貼り付けてください（空のまま Enter で保存済みのキーを削除します）"
+      : "Google AI Studio (https://aistudio.google.com/apikey) で取得したキーを貼り付けてください",
+    placeHolder: "AIza...",
+    password: true,
+    ignoreFocusOut: true,
+  });
+  if (input === undefined) {
+    return; // Esc でキャンセル
+  }
+  const key = input.trim();
+  if (key) {
+    await secrets.store(API_KEY_SECRET, key);
+    void vscode.window.showInformationMessage(
+      "QQQuestionAI: API キーを保存しました。バックエンドを再起動します"
+    );
+  } else if (existing) {
+    await secrets.delete(API_KEY_SECRET);
+    void vscode.window.showInformationMessage("QQQuestionAI: 保存済みの API キーを削除しました");
+  } else {
+    return;
+  }
+  await restartBackend(client);
+}
+
+// 起動済みバックエンドは古い環境変数のまま動いているため、キーの変更後は
+// プロセスごと入れ直す。
+async function restartBackend(client: BackendClient): Promise<void> {
+  if (!backendProcess) {
+    if (await client.health()) {
+      void vscode.window.showWarningMessage(
+        "QQQuestionAI: このウィンドウ以外が起動したバックエンドが動いています。" +
+          "新しいキーを反映するには、そのウィンドウを再読み込みしてください"
+      );
+      return;
+    }
+    await startBackend(client);
+    return;
+  }
+  await stopBackend();
+  // ポートが解放されるまで待つ（health が通るうちは startBackend が起動を省略する）
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && (await client.health())) {
+    await delay(300);
+  }
+  await startBackend(client);
+}
+
+function stopBackend(): Promise<void> {
+  const proc = backendProcess;
+  if (!proc) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 5000);
+    proc.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    proc.kill();
+  });
 }
 
 function startPolling(client: BackendClient): void {
@@ -257,11 +359,13 @@ export function activate(context: vscode.ExtensionContext): void {
   output = vscode.window.createOutputChannel("QQQuestionAI");
   extensionPath = context.extensionPath;
   globalStoragePath = context.globalStorageUri.fsPath;
+  secrets = context.secrets;
   const client = new BackendClient(config().get<number>("port", 8756));
 
   context.subscriptions.push(
     vscode.commands.registerCommand("qqquestion.startBackend", () => startBackend(client)),
     vscode.commands.registerCommand("qqquestion.installHook", () => installHook()),
+    vscode.commands.registerCommand("qqquestion.setApiKey", () => setApiKey(client)),
     output
   );
 

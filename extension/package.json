@@ -1,9 +1,9 @@
 {
-  "name": "qqquestion-ai",
-  "displayName": "QQQuestionAI",
+  "name": "qqquestion-ai-v",
+  "displayName": "QQQuestionAIVSCode",
   "description": "コミット前に差分から5問出題し、コードの理解度を確認する学習支援AI。答えは教えず、ヒントだけを提示します。",
   "version": "0.2.0",
-  "publisher": "Endo-Yuto",
+  "publisher": "Back-Room",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -27,6 +27,10 @@
       {
         "command": "qqquestion.installHook",
         "title": "QQQuestionAI: pre-commit フックをインストール"
+      },
+      {
+        "command": "qqquestion.setApiKey",
+        "title": "QQQuestionAI: API キーを設定"
       }
     ],
     "configuration": {
