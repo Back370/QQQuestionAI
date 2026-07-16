@@ -2,7 +2,7 @@
   "name": "qqquestion-ai",
   "displayName": "QQQuestionAI",
   "description": "コミット前に差分から5問出題し、コードの理解度を確認する学習支援AI。答えは教えず、ヒントだけを提示します。",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "Endo-Yuto",
   "engines": {
     "vscode": "^1.85.0"
@@ -35,7 +35,7 @@
         "qqquestion.pythonPath": {
           "type": "string",
           "default": "",
-          "description": "バックエンド起動に使う Python。空なら backend/.venv/bin/python → python3 の順で探す"
+          "description": "バックエンド起動に使う Python。空なら (1)ワークスペースの backend/.venv → (2)拡張が初回に自動作成する専用 venv の順で使う。既存の Python 環境を使いたい場合だけ指定する"
         },
         "qqquestion.port": {
           "type": "number",
@@ -51,8 +51,10 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "bundle": "node scripts/bundle-backend.js",
+    "compile": "node scripts/bundle-backend.js && tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

@@ -20,14 +20,24 @@
 
 ## 前提
 
-この拡張は同リポジトリの Python バックエンド（`backend/`）を起動して動作します。
+この拡張は Python バックエンドを起動して動作します。**バックエンドは拡張に同梱されている**ため、
+リポジトリの clone は不要です。必要なのは **Python 3.11 以上**が入っていることだけです。
 
-1. `backend/` で venv を作成し依存をインストールする（リポジトリの CLAUDE.md 参照）
-2. `backend/.env` に `GOOGLE_API_KEY` を設定する（`backend/env.example` をコピー）。
-   API キーなしで試す場合は設定 `qqquestion.fakeLlm` を有効にする
-3. コマンド「QQQuestionAI: pre-commit フックをインストール」を対象リポジトリで実行する
+1. **Python 3.11+ を用意する**（`python3 --version` で確認。無ければ python.org 等から導入）。
+   初回起動時、拡張が専用の仮想環境を自動作成し、必要な依存を自動インストールします
+   （数十秒かかります。以降は再利用されます）。
+2. **API キーを設定する**。実運用では環境変数 `GOOGLE_API_KEY`（Gemini）を設定してください。
+   キー無しで試すだけなら、設定 `qqquestion.fakeLlm` を有効にすればデモモードで動きます。
+3. 理解度チェックを行いたいリポジトリを VSCode で開き、コマンド
+   「QQQuestionAI: pre-commit フックをインストール」を実行する
    （pre-commit フックの導入と `-q` 検知シェル関数の `~/.zshrc` への追記まで自動で行われる。
    反映に一度 `source ~/.zshrc` が必要）
+
+> 既存の Python 環境を使いたい場合は、設定 `qqquestion.pythonPath` にその Python の
+> 絶対パスを指定してください（自動作成された venv より優先されます）。
+>
+> このリポジトリ自身を clone して開発している場合は、ワークスペースの `backend/`
+> とその `.venv` が優先的に使われます（同梱物ではなくソースで動きます）。
 
 ## 使い方
 

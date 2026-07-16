@@ -1,5 +1,8 @@
 src/**
+scripts/**
 tsconfig.json
 out/**/*.map
 node_modules/**
 .gitignore
+bundled/**/__pycache__/**
+bundled/**/*.pyc

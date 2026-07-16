@@ -1,0 +1,2 @@
+# backend/ と scripts/ から生成する同梱物（compile 時に作られる）
+bundled/
