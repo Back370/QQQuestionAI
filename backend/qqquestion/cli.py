@@ -69,6 +69,7 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
             diff_ctx=diff_ctx,
             learner_state=learner_state,
             history_store=HistoryStore(data / "history.jsonl"),
+            origin="cli",
         )
     except LLMUnavailableError as error:
         print(f"\n出題を生成できませんでした: {error}")

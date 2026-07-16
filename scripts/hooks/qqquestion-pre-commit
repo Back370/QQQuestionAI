@@ -32,9 +32,11 @@ fi
 
 echo "QQQuestionAI: 理解度チェックを開始します（VSCodeにクイズパネルが開きます）" >&2
 
+# origin=hook: このスクリプトは自前の UI を持たないので、VSCode 拡張に
+# クイズパネルを開いてもらう必要がある（拡張が /quiz/pending で拾う）
 START_RESPONSE=$(curl -s -m 120 -X POST "${BASE}/quiz/start" \
     -H "Content-Type: application/json" \
-    -d "{\"repo_path\": \"$(pwd)\"}")
+    -d "{\"repo_path\": \"$(pwd)\", \"origin\": \"hook\"}")
 
 SESSION_ID=$(printf '%s' "$START_RESPONSE" | python3 -c \
     'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)

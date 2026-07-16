@@ -25,6 +25,7 @@ from .models import (
     Interaction,
     Judgement,
     Question,
+    QuizOrigin,
 )
 from .question_gen import (
     TOTAL_QUESTIONS,
@@ -72,6 +73,7 @@ class QuizSession:
         session_id: str | None = None,
         defer_questions: bool = False,
         repo_path: str | None = None,
+        origin: QuizOrigin = "hook",
     ):
         self.id = session_id or uuid.uuid4().hex[:12]
         self._llm = llm
@@ -82,6 +84,9 @@ class QuizSession:
         # コミットが走ったリポジトリの絶対パス。/quiz/pending が「どのVSCode
         # ウィンドウにクイズを出すか」をワークスペースと突き合わせて決めるのに使う
         self.repo_path = repo_path
+        # 起動元。cli / ui は自分で UI を持っているので、拡張がパネルを開くと
+        # 二重表示になる（/quiz/pending は hook 起点だけを返す）
+        self.origin: QuizOrigin = origin
         self.status = "in_progress"  # in_progress | completed | aborted
         self.error: str | None = None  # 出題生成に失敗したときのメッセージ
 

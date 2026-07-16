@@ -1,8 +1,9 @@
 """FastAPI ローカルサーバ（architecture.md §3）。
 
 - git pre-commit フック: POST /quiz/start → GET /quiz/{sid}/status をポーリング
-- VSCode 拡張: GET /quiz/pending をポーリングして新規セッションを拾い、
-  Webview から answer / hint / giveup / abort を叩く
+- VSCode 拡張: GET /quiz/pending をポーリングしてフック起点のセッションを拾い、
+  Webview から answer / hint / giveup / abort を叩く（フックは自前の UI を
+  持たないため、この経路でしか出題できない）
 - 127.0.0.1 のみで待ち受ける。模範解答は問題が終わるまでレスポンスに含めない
 """
 
@@ -30,7 +31,7 @@ from .knowledge_base import (
 )
 from .learner_model import HistoryStore, load_learner_state
 from .llm import StructuredLLM, create_llm
-from .models import DiffContext
+from .models import DiffContext, QuizOrigin
 from .session import QuizSession
 
 DEFAULT_PORT = 8756
@@ -84,6 +85,10 @@ def default_deps() -> AppDeps:
 
 class StartRequest(BaseModel):
     repo_path: str = "."
+    # 既定を "hook" にするのは後方互換のため。origin を送らない旧クライアントは
+    # 旧フックの可能性があり、パネルが開かないとコミットが進まず固まる。誤って
+    # パネルが開くほうが、待ち続けて固まるより安全（従来の挙動と同じ）。
+    origin: QuizOrigin = "hook"
 
 
 class AnswerRequest(BaseModel):
@@ -204,7 +209,7 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
 
     @app.post("/quiz/start")
     def start(request: StartRequest):
-        logger.info("クイズ開始要求: repo=%s", request.repo_path)
+        logger.info("クイズ開始要求: repo=%s origin=%s", request.repo_path, request.origin)
         diff_ctx = deps.diff_provider(request.repo_path)
         if not diff_ctx.diff_text.strip():
             logger.warning("ステージ済みの差分が無いため 400 を返します: repo=%s", request.repo_path)
@@ -218,6 +223,7 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
             history_store=HistoryStore(deps.history_path),
             defer_questions=True,
             repo_path=os.path.abspath(request.repo_path),
+            origin=request.origin,
         )
         # 生成前にセッションを公開する: 拡張の /quiz/pending ポーリングが即座に
         # 拾ってパネルを開き、「生成中」を表示できる
@@ -264,7 +270,13 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
 
     @app.get("/quiz/pending")
     def pending(workspace: list[str] = Query(default=[])):
-        """UI が未表示のセッション一覧。返したものは claimed 扱いにする。
+        """パネルを開いてほしいセッション一覧。返したものは claimed 扱いにする。
+
+        返すのは origin="hook" のセッションだけ。フックは curl のシェル
+        スクリプトで自前の UI を持たず、拡張にパネルを開いてもらう以外に
+        出題する手段がないため、このポーリングがフックから VSCode への唯一の
+        通知経路になっている。一方 cli（端末の quiz）と ui（拡張のコマンド）は
+        既に自分の UI で出題しているので、ここで返すと二重表示になる。
 
         複数の VSCode ウィンドウが同じバックエンドを共有するため、コミットが
         走ったリポジトリ（session.repo_path）を、ポーリング元ウィンドウの
@@ -291,6 +303,8 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
         for session in deps.sessions.values():
             if session.status != "in_progress" or session.id in deps.claimed:
                 continue
+            if session.origin != "hook":
+                continue  # cli / ui は自前の UI で出題済み。パネルを開かない
             if not workspaces or _repo_matches_workspaces(session.repo_path, workspaces):
                 claim(session)
                 continue

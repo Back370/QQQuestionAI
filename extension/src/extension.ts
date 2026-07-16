@@ -303,9 +303,8 @@ function stopBackend(): Promise<void> {
 
 function startPolling(client: BackendClient): void {
   pollTimer = setInterval(async () => {
-    if (!(await client.health())) {
-      return;
-    }
+    // health は確認しない: バックエンドが落ちていれば pending がそのまま失敗し、
+    // 下の catch が拾う。1.5 秒ごとにリクエストを 2 本投げるとログが埋まる
     try {
       // 自ウィンドウのワークスペースを渡す。バックエンドはコミットが走った
       // リポジトリと一致するセッションだけ返すので、別ウィンドウにパネルが

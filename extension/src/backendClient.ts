@@ -53,6 +53,9 @@ export interface StreamEvent {
 const DEFAULT_TIMEOUT_MS = 10_000;
 // LLM 呼び出しを伴うエンドポイントは生成に時間がかかるため長めに待つ
 const LLM_TIMEOUT_MS = 60_000;
+// ポーリングは 1.5 秒ごとに繰り返すので、ハングしたバックエンドを 10 秒待つと
+// 呼び出しが積み上がる。次の周回で取り返せるので短く諦める
+const POLL_TIMEOUT_MS = 2_000;
 
 export class BackendClient {
   constructor(private readonly port: number) {}
@@ -118,7 +121,9 @@ export class BackendClient {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repo_path: repoPath }),
+        // origin="ui": 呼び出し元（startQuiz）が自分でパネルを開くので、
+        // /quiz/pending のポーリングには載せない
+        body: JSON.stringify({ repo_path: repoPath, origin: "ui" }),
       },
       LLM_TIMEOUT_MS
     );
@@ -126,11 +131,16 @@ export class BackendClient {
 
   // このウィンドウのワークスペースパスを渡し、コミットが走ったリポジトリと
   // 一致するセッションだけ受け取る（別ウィンドウでパネルが開くのを防ぐ）。
+  // バックエンド未起動なら例外になるので、呼び出し側の health 確認は要らない。
   pending(workspaces: string[] = []): Promise<{ sessions: PendingSession[] }> {
     const query = workspaces
       .map((w) => `workspace=${encodeURIComponent(w)}`)
       .join("&");
-    return this.request(`/quiz/pending${query ? `?${query}` : ""}`);
+    return this.request(
+      `/quiz/pending${query ? `?${query}` : ""}`,
+      undefined,
+      POLL_TIMEOUT_MS
+    );
   }
 
   question(sessionId: string): Promise<{

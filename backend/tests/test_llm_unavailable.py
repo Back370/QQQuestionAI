@@ -13,10 +13,12 @@ from fastapi.testclient import TestClient
 from qqquestion.diff_analyzer import analyze
 from qqquestion.knowledge_base import InMemoryKnowledgeBase
 from qqquestion.llm import (
+    DEFAULT_MODEL,
     DEFAULT_TIMEOUT,
     GeminiLLM,
     LLMUnavailableError,
     _classify_llm_error,
+    _fast_thinking_kwargs,
     _is_unavailable_error,
     _llm_timeout,
 )
@@ -53,8 +55,65 @@ def test_is_unavailable_error_distinguishes_fallbackable():
     # フォールバックしても直らない失敗
     assert _is_unavailable_error(TimeoutError())
     assert _is_unavailable_error(RuntimeError("429 quota"))
-    # thinking_budget 非対応など、通常経路で作り直せる失敗
+    # thinking パラメータ非対応など、通常経路で作り直せる失敗
     assert not _is_unavailable_error(TypeError("unexpected keyword 'thinking_budget'"))
+
+
+# ---- モデル提供終了(404) ---------------------------------------------
+
+
+def test_classify_retired_model_guides_to_qqq_model(monkeypatch):
+    """退役モデルの 404 は、生の例外ではなく次の一手を案内する。
+
+    Google は退役モデルを新規プロジェクトにだけ 404 にするため、既存キーの
+    開発者では再現せず、新しくAPIキーを取った利用者だけが踏む。
+    """
+    monkeypatch.setenv("QQQ_MODEL", "gemini-2.5-flash")
+    error = RuntimeError(
+        "Error calling model 'gemini-2.5-flash' (NOT_FOUND): 404 NOT_FOUND. "
+        "This model is no longer available to new users."
+    )
+    message = _classify_llm_error(error)
+    assert "gemini-2.5-flash" in message  # どのモデルが駄目なのか
+    assert "QQQ_MODEL" in message  # どう直すのか
+
+
+def test_retired_model_404_does_not_double_wait():
+    """404 は通常生成へ落としても同じ 404 になるので即座に伝える（二重待ち回避）。"""
+    error = RuntimeError("404 NOT_FOUND: no longer available to new users")
+    assert _is_unavailable_error(error)
+
+
+# ---- 速度優先の thinking パラメータはモデル世代で変わる ---------------
+
+
+def test_fast_thinking_kwargs_per_model_generation():
+    # Gemini 3 以降は thinking_budget を受け付けず thinking_level を使う。
+    # 完全な無効化は不可なので最小の "minimal"。
+    assert _fast_thinking_kwargs("gemini-3.5-flash") == {"thinking_level": "minimal"}
+    assert _fast_thinking_kwargs("gemini-3-flash") == {"thinking_level": "minimal"}
+    # 2.x 系は従来どおり thinking_budget=0 で無効化できる
+    assert _fast_thinking_kwargs("gemini-2.5-flash") == {"thinking_budget": 0}
+    # 未知の名前は従来動作（非対応なら generate へフォールバックする）
+    assert _fast_thinking_kwargs("some-custom-model") == {"thinking_budget": 0}
+
+
+def test_fast_thinking_kwargs_matches_installed_library():
+    """渡す引数名が langchain-google-genai に実在することを固定する。
+
+    存在しない引数名だと pydantic の extra=ignore で黙って捨てられ、
+    thinking が既定(medium)のまま「速度優先のはずが遅い」に静かに退行する。
+    """
+    genai = pytest.importorskip("langchain_google_genai")
+    fields = genai.ChatGoogleGenerativeAI.model_fields
+    for model in ("gemini-3.5-flash", "gemini-2.5-flash"):
+        for name in _fast_thinking_kwargs(model):
+            assert name in fields, f"{name} が langchain-google-genai に無い"
+
+
+def test_default_model_is_not_a_retired_one():
+    """既定モデルは新規プロジェクトで 404 になったものに戻さない。"""
+    assert DEFAULT_MODEL not in {"gemini-2.0-flash", "gemini-2.5-flash"}
 
 
 # ---- タイムアウト設定 -------------------------------------------------

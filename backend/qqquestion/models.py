@@ -9,6 +9,9 @@ from pydantic import BaseModel, Field, field_validator
 
 QuestionType = Literal["prerequisite", "implementation"]
 Verdict = Literal["correct", "partial", "incorrect"]
+# クイズの起動元。hook だけが自前の UI を持たず、VSCode 拡張にパネルを開いて
+# もらう必要がある（/quiz/pending が hook 起点だけを返す根拠）。
+QuizOrigin = Literal["hook", "cli", "ui"]
 
 
 class _CitedModel(BaseModel):

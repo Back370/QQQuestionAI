@@ -186,7 +186,8 @@ def run(repo: str, port: int) -> int:
 
         response = client.post(
             f"{_base_url(port)}/quiz/start",
-            json={"repo_path": os.path.abspath(repo)},
+            # origin="cli": 出題はこの端末で行う。拡張にパネルを開かせない
+            json={"repo_path": os.path.abspath(repo), "origin": "cli"},
             timeout=LLM_TIMEOUT,
         )
         if response.status_code == 400:
