@@ -14,7 +14,7 @@
 # （＝浮動）。完全に固定するにはハッシュ付きロック（pip-compile --generate-hashes）
 # が要るが、Windows/macOS/Linux で解決結果が変わりうる構成なので採用していない。
 
-fastapi==0.139.0
+fastapi==0.139.1
 uvicorn==0.51.0
 pydantic==2.13.4
 httpx==0.28.1
