@@ -37,6 +37,10 @@
         "title": "QQQuestionAI: API キーを設定"
       },
       {
+        "command": "qqquestion.deleteApiKey",
+        "title": "QQQuestionAI: API キーを削除"
+      },
+      {
         "command": "qqquestion.setupTerminalQuiz",
         "title": "QQQuestionAI: ターミナルの quiz コマンドを設定"
       }

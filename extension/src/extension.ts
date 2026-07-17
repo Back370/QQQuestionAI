@@ -239,7 +239,7 @@ async function setApiKey(client: BackendClient): Promise<void> {
   const input = await vscode.window.showInputBox({
     title: "QQQuestionAI: Gemini の API キー",
     prompt: existing
-      ? "新しいキーを貼り付けてください（空のまま Enter で保存済みのキーを削除します）"
+      ? "キーは保存済みです。置き換える場合だけ新しいキーを貼り付けてください（削除は「QQQuestionAI: API キーを削除」）"
       : "Google AI Studio (https://aistudio.google.com/apikey) で取得したキーを貼り付けてください",
     placeHolder: "AIza...",
     password: true,
@@ -249,17 +249,41 @@ async function setApiKey(client: BackendClient): Promise<void> {
     return; // Esc でキャンセル
   }
   const key = input.trim();
-  if (key) {
-    await secrets.store(API_KEY_SECRET, key);
-    void vscode.window.showInformationMessage(
-      "QQQuestionAI: API キーを保存しました。バックエンドを再起動します"
-    );
-  } else if (existing) {
-    await secrets.delete(API_KEY_SECRET);
-    void vscode.window.showInformationMessage("QQQuestionAI: 保存済みの API キーを削除しました");
-  } else {
+  // 空入力は「何もしない」。password:true の入力欄は保存済みでも空欄に見えるため、
+  // 設定状況を確かめるつもりの Enter でキーが消えるのを防ぐ。削除は deleteApiKey。
+  if (!key) {
     return;
   }
+  await secrets.store(API_KEY_SECRET, key);
+  void vscode.window.showInformationMessage(
+    "QQQuestionAI: API キーを保存しました。バックエンドを再起動します"
+  );
+  await restartBackend(client);
+}
+
+// 削除は明示的な操作でのみ行う。起動済みバックエンドは削除前のキーを環境変数として
+// 抱えたままなので、削除後は再起動して実際に使えない状態へ揃える。
+async function deleteApiKey(client: BackendClient): Promise<void> {
+  const existing = await secrets.get(API_KEY_SECRET);
+  if (!existing) {
+    void vscode.window.showInformationMessage(
+      "QQQuestionAI: 保存済みの API キーはありません"
+    );
+    return;
+  }
+  const deleteLabel = "削除する";
+  const choice = await vscode.window.showWarningMessage(
+    "QQQuestionAI: 保存済みの API キーを削除しますか？ 削除すると、キーを設定し直すまで問題を生成できなくなります",
+    { modal: true },
+    deleteLabel
+  );
+  if (choice !== deleteLabel) {
+    return;
+  }
+  await secrets.delete(API_KEY_SECRET);
+  void vscode.window.showInformationMessage(
+    "QQQuestionAI: 保存済みの API キーを削除しました。バックエンドを再起動します"
+  );
   await restartBackend(client);
 }
 
@@ -553,6 +577,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("qqquestion.startBackend", () => startBackend(client)),
     vscode.commands.registerCommand("qqquestion.installHook", () => installHook()),
     vscode.commands.registerCommand("qqquestion.setApiKey", () => setApiKey(client)),
+    vscode.commands.registerCommand("qqquestion.deleteApiKey", () => deleteApiKey(client)),
     vscode.commands.registerCommand("qqquestion.setupTerminalQuiz", () => setupTerminalQuiz()),
     // ポートを変えると shim に焼き込んだ値が古くなるため作り直す
     vscode.workspace.onDidChangeConfiguration((event) => {
