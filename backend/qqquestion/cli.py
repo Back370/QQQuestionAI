@@ -75,6 +75,19 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
         print(f"\n出題を生成できませんでした: {error}")
         return 1
 
+    try:
+        return _quiz_loop(session)
+    except LLMUnavailableError as error:
+        # クイズ中にキーが失効した等。待っても次の呼び出しも失敗するので、
+        # 理由を出して畳む（セッションは session 側で終了済み）
+        print(f"\n警告: {error}")
+        print("AIサービスを利用できないため理解度チェックを終了します。（コミットには影響しません）")
+        print(session.report().render())
+        return 1
+
+
+def _quiz_loop(session: QuizSession) -> int:
+    """全問を出題し終えるまで対話する。返り値はプロセスの終了コード。"""
     while not session.finished:
         view = session.current_public()
         assert view is not None

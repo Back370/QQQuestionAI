@@ -190,6 +190,12 @@ async function startBackend(client: BackendClient): Promise<void> {
   if (config().get<boolean>("fakeLlm", false)) {
     env.QQQ_FAKE_LLM = "1";
   }
+  // 検索の off は QQQ_NO_SEARCH 環境変数しか口が無く、GUI 起動の VSCode は
+  // シェルの環境変数を引き継がない（API キーを SecretStorage に預けているのと
+  // 同じ理由）。設定から渡さないと、利用者に検索を止める手段が実質存在しない。
+  if (!config().get<boolean>("webSearch", true)) {
+    env.QQQ_NO_SEARCH = "1";
+  }
   // 拡張が預かっているキーを優先する（コマンドで明示的に設定されたものなので、
   // 引き継いだ環境変数より意図が新しい）。
   const storedKey = await secrets.get(API_KEY_SECRET);

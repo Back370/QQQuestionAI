@@ -39,6 +39,13 @@ class BackendUnavailable(RuntimeError):
     """バックエンドに接続できない。"""
 
 
+class QuizUnavailable(RuntimeError):
+    """バックエンドの AI が使えなくなった（キーの失効・レート制限等）。
+
+    message はバックエンドが作った利用者向けの日本語で、そのまま表示できる。
+    """
+
+
 def _base_url(port: int) -> str:
     return f"http://127.0.0.1:{port}"
 
@@ -83,15 +90,36 @@ def _iter_sse(response) -> Iterator[dict]:
                 yield json.loads(raw[len("data: ") :])
 
 
+def _raise_if_unavailable(response) -> None:
+    """AI が使えない 503 を QuizUnavailable に変換する。
+
+    detail はバックエンドが分類した日本語なので、そのまま利用者に見せる。
+    """
+    if response.status_code != 503:
+        return
+    response.read()  # stream 応答は読むまで本文を参照できない
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        detail = None
+    raise QuizUnavailable(detail or "AIサービスを利用できません")
+
+
 def _consume_stream(client, url: str, json_body: dict | None = None) -> dict | None:
     """SSE を逐次表示しながら最終結果 (result イベント) を返す。"""
     reason = _TypeWriter()
     explanation = _TypeWriter()
     result: dict | None = None
     with client.stream("POST", url, json=json_body, timeout=LLM_TIMEOUT) as response:
+        _raise_if_unavailable(response)
         response.raise_for_status()
         for event in _iter_sse(response):
             name = event.get("event")
+            if name == "error":
+                # AI 停止の終端イベント。ここまでの表示を閉じてから伝える
+                if reason.started or explanation.started:
+                    print()
+                raise QuizUnavailable(event.get("message", "AIサービスを利用できません"))
             if name == "judgement_partial":
                 if not reason.started:
                     print("先生> ", end="", flush=True)
@@ -206,46 +234,67 @@ def run(repo: str, port: int) -> int:
             print(f"\n警告: {body['error']}")
         print()
 
-        while True:
-            view = _wait_for_question(client, port, sid)
-            if view is None:
-                break
-            _print_question(view)
-            while True:
-                try:
-                    user_input = input("あなた> ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print("\n中断しました。（コミットには影響しません）")
-                    client.post(f"{_base_url(port)}/quiz/{sid}/abort", timeout=TIMEOUT)
-                    return 1
-                if not user_input:
-                    continue
-                if user_input in ("ヒント", "hint"):
-                    hint_body = client.post(
-                        f"{_base_url(port)}/quiz/{sid}/hint", timeout=LLM_TIMEOUT
-                    ).json()["hint"]
-                    print(f"先生(ヒント)> {hint_body['hint']}")
-                    for url_ in hint_body.get("citations") or []:
-                        print(f"  出典: {url_}")
-                    continue
-                if user_input in ("ギブアップ", "giveup"):
-                    _consume_stream(client, f"{_base_url(port)}/quiz/{sid}/giveup/stream")
-                    break
-                result = (
-                    _consume_stream(
-                        client,
-                        f"{_base_url(port)}/quiz/{sid}/answer/stream",
-                        {"answer": user_input},
-                    )
-                    or {}
-                )
-                if (result.get("judgement") or {}).get("verdict") == "correct":
-                    break
-            print()
+        try:
+            if _quiz_loop(client, port, sid):
+                return 1  # 利用者が中断した（abort 済み。レポートは出さない）
+        except QuizUnavailable as error:
+            # クイズ中にバックエンドの AI が使えなくなった（キーの失効等）。
+            # セッションはバックエンド側で畳まれているので、理由を出して終わる
+            print(f"\n警告: {error}")
+            print("AIサービスを利用できないため理解度チェックを終了します。（コミットには影響しません）")
+            _print_report(client, port, sid)
+            return 1
 
-        report = client.get(f"{_base_url(port)}/quiz/{sid}/report", timeout=LLM_TIMEOUT).json()
-        print(report.get("rendered", ""))
+        _print_report(client, port, sid)
         return 0
+
+
+def _print_report(client, port: int, sid: str) -> None:
+    report = client.get(f"{_base_url(port)}/quiz/{sid}/report", timeout=LLM_TIMEOUT).json()
+    print(report.get("rendered", ""))
+
+
+def _quiz_loop(client, port: int, sid: str) -> bool:
+    """全問を出題し終えるまで対話する。True なら利用者が中断した（Ctrl-C）。"""
+    while True:
+        view = _wait_for_question(client, port, sid)
+        if view is None:
+            break
+        _print_question(view)
+        while True:
+            try:
+                user_input = input("あなた> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n中断しました。（コミットには影響しません）")
+                client.post(f"{_base_url(port)}/quiz/{sid}/abort", timeout=TIMEOUT)
+                return True
+            if not user_input:
+                continue
+            if user_input in ("ヒント", "hint"):
+                hint_response = client.post(
+                    f"{_base_url(port)}/quiz/{sid}/hint", timeout=LLM_TIMEOUT
+                )
+                _raise_if_unavailable(hint_response)
+                hint_body = hint_response.json()["hint"]
+                print(f"先生(ヒント)> {hint_body['hint']}")
+                for url_ in hint_body.get("citations") or []:
+                    print(f"  出典: {url_}")
+                continue
+            if user_input in ("ギブアップ", "giveup"):
+                _consume_stream(client, f"{_base_url(port)}/quiz/{sid}/giveup/stream")
+                break
+            result = (
+                _consume_stream(
+                    client,
+                    f"{_base_url(port)}/quiz/{sid}/answer/stream",
+                    {"answer": user_input},
+                )
+                or {}
+            )
+            if (result.get("judgement") or {}).get("verdict") == "correct":
+                break
+        print()
+    return False
 
 
 def main() -> None:

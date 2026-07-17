@@ -56,17 +56,19 @@ while :; do
             REPORT_JSON=$(curl -s -m 5 "${BASE}/quiz/${SESSION_ID}/report")
             printf '%s' "$REPORT_JSON" | python3 -c \
                 'import json,sys; print(json.load(sys.stdin).get("rendered",""))' 2>/dev/null >&2
-            ATTEMPTED=$(printf '%s' "$REPORT_JSON" | python3 -c \
-                'import json,sys; print(json.load(sys.stdin).get("report",{}).get("attempted",0))' 2>/dev/null)
-            # attempted=0 は出題できずに fail-open でスキップした状態（例: APIのレート制限）。
-            # 「完走」と偽らず、開始レスポンスの error を理由として添える。
-            if [ "$ATTEMPTED" = "0" ]; then
-                REASON=$(printf '%s' "$START_RESPONSE" | python3 -c \
-                    'import json,sys; print(json.load(sys.stdin).get("error") or "")' 2>/dev/null)
-                echo "QQQuestionAI: 出題できなかったため理解度チェックをスキップしてコミットを続行します" >&2
-                [ -n "$REASON" ] && echo "  理由: $REASON" >&2
-            else
+            # completed=false は最後の問題まで到達しなかった状態。出題できずに
+            # スキップした場合（attempted=0。例: APIのレート制限）と、クイズ中に
+            # AI が使えなくなった場合（例: APIキーの期限切れ）の両方が該当する。
+            # どちらも fail-open でコミットは続行するが、「完走」と偽らない。
+            OUTCOME=$(printf '%s' "$REPORT_JSON" | python3 -c \
+                'import json,sys; r=json.load(sys.stdin).get("report",{}); print("completed" if r.get("attempted") and r.get("completed") else "skipped")' 2>/dev/null)
+            if [ "$OUTCOME" = "completed" ]; then
                 echo "QQQuestionAI: 理解度チェック完走。コミットを続行します" >&2
+            else
+                REASON=$(printf '%s' "$REPORT_JSON" | python3 -c \
+                    'import json,sys; print(json.load(sys.stdin).get("error") or "")' 2>/dev/null)
+                echo "QQQuestionAI: 理解度チェックを最後まで実施できなかったため、スキップしてコミットを続行します" >&2
+                [ -n "$REASON" ] && echo "  理由: $REASON" >&2
             fi
             exit 0
             ;;

@@ -18,8 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import diff_analyzer
@@ -30,11 +30,15 @@ from .knowledge_base import (
     create_search_provider,
 )
 from .learner_model import HistoryStore, load_learner_state
-from .llm import StructuredLLM, create_llm
+from .llm import LLMUnavailableError, StructuredLLM, create_llm
 from .models import DiffContext, QuizOrigin
 from .session import QuizSession
 
 DEFAULT_PORT = 8756
+
+# LLM(API) が使えないときに返すステータス。UI はこれを「復旧しない失敗」として
+# 扱い、警告を出してクイズを畳む（500 と違い、内容は利用者向けの日本語）
+LLM_UNAVAILABLE_STATUS = 503
 
 # セッションの repo_path がどのウィンドウのワークスペースにも一致しないまま
 # この秒数を過ぎたら、取りこぼし防止のためどのウィンドウでも拾えるようにする
@@ -159,23 +163,45 @@ def _sse_response(session: QuizSession, events: Iterator[tuple[str, object]]):
     """
 
     def generate() -> Iterator[str]:
-        for name, payload in events:
-            if name == "result":
-                data = _answer_payload(payload)
-                data["next_question"] = session.current_public()
-                data["status"] = session.status
-                yield _sse("result", data)
-            elif name == "judgement":
-                done = payload["question_done"]  # type: ignore[index]
-                data = {
-                    "judgement": _public_judgement(payload["judgement"], done),  # type: ignore[index]
-                    "question_done": done,
-                }
-                if done:
-                    data["model_answer"] = payload["model_answer"]  # type: ignore[index]
-                yield _sse("judgement", data)
-            else:  # judgement_partial / explanation_partial
-                yield _sse(name, payload)  # type: ignore[arg-type]
+        # ストリーム途中の例外は、ヘッダ送出済み(200)の接続が黙って切れるだけに
+        # なり、クライアントは result を待ち続ける（＝パネルが固まる）。どんな
+        # 失敗でも error イベントで終端させ、理由を UI に届ける
+        try:
+            for name, payload in events:
+                if name == "result":
+                    data = _answer_payload(payload)
+                    data["next_question"] = session.current_public()
+                    data["status"] = session.status
+                    yield _sse("result", data)
+                elif name == "judgement":
+                    done = payload["question_done"]  # type: ignore[index]
+                    data = {
+                        "judgement": _public_judgement(payload["judgement"], done),  # type: ignore[index]
+                        "question_done": done,
+                    }
+                    if done:
+                        data["model_answer"] = payload["model_answer"]  # type: ignore[index]
+                    yield _sse("judgement", data)
+                else:  # judgement_partial / explanation_partial
+                    yield _sse(name, payload)  # type: ignore[arg-type]
+        except LLMUnavailableError as error:
+            # セッションは session 側で畳み済み（status=completed）。UI は理由を
+            # 警告として出し、レポートを表示して終われる
+            logger.warning(
+                "ストリーム中にAIが利用不能になりました: session=%s error=%s",
+                session.id,
+                error,
+            )
+            yield _sse("error", {"message": str(error), "status": session.status})
+        except Exception as error:
+            logger.exception("ストリームの処理に失敗しました: session=%s", session.id)
+            yield _sse(
+                "error",
+                {
+                    "message": f"応答の生成に失敗しました: {error}",
+                    "status": session.status,
+                },
+            )
 
     return StreamingResponse(
         generate(),
@@ -202,6 +228,24 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
     if deps is None:
         deps = default_deps()
     app.state.deps = deps
+
+    @app.exception_handler(LLMUnavailableError)
+    async def llm_unavailable(request: Request, error: LLMUnavailableError) -> JSONResponse:
+        """AI が使えない失敗を、利用者向けの理由付き 503 として返す。
+
+        これが無いと 500 + 生スタックになり、UI には「HTTP 500」としか出ない。
+        セッションは session 側で畳まれているので、UI はこの detail を警告に
+        出してレポートへ進める。
+        """
+        logger.warning(
+            "AIが利用できないため %d を返します: path=%s error=%s",
+            LLM_UNAVAILABLE_STATUS,
+            request.url.path,
+            error,
+        )
+        return JSONResponse(
+            status_code=LLM_UNAVAILABLE_STATUS, content={"detail": str(error)}
+        )
 
     @app.get("/health")
     def health():
@@ -412,6 +456,9 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
         session_report = session.report()
         return {
             "status": session.status,
+            # 完走しなかった理由（出題失敗・クイズ中のAI停止）。フックと拡張が
+            # 「スキップ/中断」の理由として利用者に見せる
+            "error": session.error,
             "report": {
                 "attempted": session_report.attempted,
                 "first_correct_rate": session_report.first_correct_rate,

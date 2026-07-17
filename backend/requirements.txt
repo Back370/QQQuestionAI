@@ -20,3 +20,8 @@ pydantic==2.13.4
 httpx==0.28.1
 langchain-core==1.4.9
 langchain-google-genai==4.2.7
+# 解説の裏付けに使う Web 検索。これが入っていないと create_search_provider() は
+# 検索なし(None)を返すため、拡張の利用者では検索が一切発生しなかった。既定で有効に
+# なる＝トピック名が DuckDuckGo に送られるので、設定 qqquestion.webSearch で
+# 止められるようにしてある（off で QQQ_NO_SEARCH=1 が渡る）。
+ddgs==9.14.4

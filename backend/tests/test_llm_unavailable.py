@@ -5,11 +5,14 @@
   （サーバは立ち上がったまま、fail-open 経路でユーザーに理由を伝えるため）
 - prepare_first が LLMUnavailableError でも fail-open でコミットを通し、
   理由を session.error に載せる（拡張が「生成に失敗」として表示できる）
+- クイズ中（判定・ヒント・解説）にキーが失効しても固まらない: セッションを
+  畳んで理由を伝え、フックがコミットを続行できる状態にする
 """
 
 import pytest
 from fastapi.testclient import TestClient
 
+from qqquestion.demo import build_demo_llm
 from qqquestion.diff_analyzer import analyze
 from qqquestion.knowledge_base import InMemoryKnowledgeBase
 from qqquestion.llm import (
@@ -26,6 +29,7 @@ from qqquestion.server import AppDeps, create_app
 from qqquestion.session import QuizSession
 
 from .conftest import SAMPLE_DIFF
+from .test_streaming import _sse_events
 
 
 # ---- エラー分類 -------------------------------------------------------
@@ -178,3 +182,163 @@ def test_start_endpoint_reports_unavailable_reason(tmp_path):
     question = client.get(f"/quiz/{session_id}/question").json()
     assert question["question"] is None
     assert "タイムアウト" in question["error"]
+
+
+# ---- クイズ中にキーが失効しても固まらない ----------------------------
+#
+# 出題は通ったのに、その後の判定・ヒント・解説で API が死ぬ経路（キーの
+# 利用期限切れが典型）。ここを素通しにすると、SSE は 200 のまま接続が切れて
+# UI が result を待ち続け、セッションも in_progress のまま残ってフックが
+# コミットを待ち続ける（＝固まる）。
+
+
+AUTH_ERROR = "APIキーが無効か権限がありません。GOOGLE_API_KEY を確認してください。"
+# 判定で LLM を通す（許容解答と一致すると LLM を呼ばずに正解になる）ための解答
+NO_MATCH_ANSWER = "全く関係のない答え"
+
+
+class ExpiringLLM:
+    """途中で API キーが失効する LLM。出題は成功し、以降の呼び出しが失敗する。"""
+
+    def __init__(self):
+        self._inner = build_demo_llm()
+        self.expired = False
+
+    def _check(self) -> None:
+        if self.expired:
+            raise LLMUnavailableError(AUTH_ERROR)
+
+    def generate(self, schema, system, user, temperature=0.0):
+        self._check()
+        return self._inner.generate(schema, system, user, temperature=temperature)
+
+    def generate_stream(self, schema, system, user, temperature=0.0):
+        self._check()
+        yield from self._inner.generate_stream(
+            schema, system, user, temperature=temperature
+        )
+
+
+def test_answer_after_key_expiry_ends_session(kb, diff_ctx):
+    """判定中に失効 → セッションを畳んで理由を伝える（例外は握りつぶさない）。"""
+    llm = ExpiringLLM()
+    session = QuizSession(llm=llm, kb=kb, diff_ctx=diff_ctx)
+    llm.expired = True
+
+    with pytest.raises(LLMUnavailableError):
+        session.submit_answer(NO_MATCH_ANSWER)
+
+    # aborted ではなく completed: クイズはコミットを妨げない（fail-open）
+    assert session.status == "completed"
+    assert "APIキー" in (session.error or "")
+    # ただし完走ではないので、レポートは「中断」として報告する
+    assert not session.report().completed
+    assert "(中断)" in session.report().render()
+
+
+def test_hint_after_key_expiry_ends_session(kb, diff_ctx):
+    llm = ExpiringLLM()
+    session = QuizSession(llm=llm, kb=kb, diff_ctx=diff_ctx)
+    llm.expired = True
+
+    with pytest.raises(LLMUnavailableError):
+        session.request_hint()
+    assert session.status == "completed"
+    assert "APIキー" in (session.error or "")
+
+
+def test_explanation_failure_after_giveup_ends_session(kb, diff_ctx):
+    """ギブアップ後の解説で失効 → 模範解答まで出してから畳む。"""
+    llm = ExpiringLLM()
+    session = QuizSession(llm=llm, kb=kb, diff_ctx=diff_ctx)
+    llm.expired = True
+
+    names = []
+    with pytest.raises(LLMUnavailableError):
+        for name, _payload in session.give_up_stream():
+            names.append(name)
+
+    assert names == ["judgement"]  # 模範解答は開示済み。解説の手前で落ちた
+    assert session.status == "completed"
+
+
+@pytest.fixture
+def expiring(tmp_path) -> tuple[TestClient, ExpiringLLM]:
+    llm = ExpiringLLM()
+    deps = AppDeps(
+        llm=llm,
+        kb=InMemoryKnowledgeBase(),
+        data_dir=tmp_path,
+        diff_provider=lambda repo: analyze(SAMPLE_DIFF),
+        run_in_background=lambda task: task(),
+    )
+    return TestClient(create_app(deps)), llm
+
+
+def _start(client: TestClient) -> str:
+    return client.post("/quiz/start", json={"repo_path": "."}).json()["session_id"]
+
+
+def test_answer_stream_ends_with_error_event(expiring):
+    """SSE は必ず終端イベントで終わる（UI が result を待ち続けない）。"""
+    client, llm = expiring
+    session_id = _start(client)
+    llm.expired = True
+
+    response = client.post(
+        f"/quiz/{session_id}/answer/stream", json={"answer": NO_MATCH_ANSWER}
+    )
+    assert response.status_code == 200
+    events = _sse_events(response)
+    assert events[-1]["event"] == "error"
+    assert "APIキー" in events[-1]["message"]
+    assert events[-1]["status"] == "completed"
+    # フックは status を見てコミットを続行できる（待ち続けない）
+    assert client.get(f"/quiz/{session_id}/status").json()["status"] == "completed"
+
+
+def test_giveup_stream_ends_with_error_event(expiring):
+    client, llm = expiring
+    session_id = _start(client)
+    llm.expired = True
+
+    events = _sse_events(client.post(f"/quiz/{session_id}/giveup/stream"))
+    assert [event["event"] for event in events] == ["judgement", "error"]
+    assert "APIキー" in events[-1]["message"]
+
+
+def test_hint_returns_503_with_reason(expiring):
+    """500 + 生スタックではなく、利用者向けの理由付き 503 を返す。"""
+    client, llm = expiring
+    session_id = _start(client)
+    llm.expired = True
+
+    response = client.post(f"/quiz/{session_id}/hint")
+    assert response.status_code == 503
+    assert "APIキー" in response.json()["detail"]
+    assert client.get(f"/quiz/{session_id}/status").json()["status"] == "completed"
+
+
+def test_answer_returns_503_with_reason(expiring):
+    client, llm = expiring
+    session_id = _start(client)
+    llm.expired = True
+
+    response = client.post(
+        f"/quiz/{session_id}/answer", json={"answer": NO_MATCH_ANSWER}
+    )
+    assert response.status_code == 503
+    assert "APIキー" in response.json()["detail"]
+
+
+def test_report_after_key_expiry_is_not_a_completion(expiring):
+    """途中で畳んだセッションを「完走」と報告しない（フック・拡張の誤表示防止）。"""
+    client, llm = expiring
+    session_id = _start(client)
+    llm.expired = True
+    client.post(f"/quiz/{session_id}/answer/stream", json={"answer": NO_MATCH_ANSWER})
+
+    body = client.get(f"/quiz/{session_id}/report").json()
+    assert body["report"]["completed"] is False
+    # フックはこの error を「スキップの理由」として表示する
+    assert "APIキー" in body["error"]

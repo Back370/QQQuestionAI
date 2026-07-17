@@ -22,6 +22,9 @@ class _FakeResponse:
     def json(self) -> dict:
         return self._payload
 
+    def read(self) -> bytes:
+        return b""
+
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise AssertionError(f"HTTP {self.status_code}")
@@ -110,6 +113,50 @@ def test_print_verdict_giveup_reveals_answer(capsys) -> None:
         streamed_reason=False,
     )
     assert "正解は「答え」でした" in capsys.readouterr().out
+
+
+def test_raise_if_unavailable_surfaces_backend_reason() -> None:
+    """503（AIが使えない）は、バックエンドの日本語の理由を持つ例外にする。
+
+    ここを素通しさせると .json()["hint"] が KeyError になり、利用者には
+    トレースバックしか出ない。
+    """
+    response = _FakeResponse(503, {"detail": "APIキーが無効か権限がありません。"})
+    with pytest.raises(remote_cli.QuizUnavailable) as excinfo:
+        remote_cli._raise_if_unavailable(response)
+    assert "APIキー" in str(excinfo.value)
+
+
+def test_raise_if_unavailable_ignores_normal_responses() -> None:
+    remote_cli._raise_if_unavailable(_FakeResponse(200, {"hint": {"hint": "手がかり"}}))
+
+
+def test_consume_stream_stops_on_error_event(capsys) -> None:
+    """SSE の error 終端イベントで打ち切る（result を待ち続けない）。"""
+
+    class _Client:
+        def stream(self, *args, **kwargs):
+            return self
+
+        def __enter__(self):
+            return _StreamResponse()
+
+        def __exit__(self, *args):
+            return False
+
+    class _StreamResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def iter_text(self):
+            yield 'data: {"event": "judgement_partial", "reason": "採点中"}\n\n'
+            yield 'data: {"event": "error", "message": "APIキーが無効か権限がありません。"}\n\n'
+
+    with pytest.raises(remote_cli.QuizUnavailable) as excinfo:
+        remote_cli._consume_stream(_Client(), "http://127.0.0.1:8756/x")
+    assert "APIキー" in str(excinfo.value)
 
 
 def test_module_holds_no_api_key_handling() -> None:

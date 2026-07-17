@@ -17,7 +17,7 @@ from .hint_gen import generate_hint
 from .judge import judge_answer_stream
 from .knowledge_base import KnowledgeBase
 from .learner_model import HistoryStore, LearnerState
-from .llm import StructuredLLM
+from .llm import LLMUnavailableError, StructuredLLM
 from .models import (
     DiffContext,
     Explanation,
@@ -227,6 +227,9 @@ class QuizSession:
           ("explanation_partial", {"explanation": str}) — 解説の途中経過
           ("result", AnswerResult)                      — 最終結果（必ず最後）
         """
+        return self._guard(self._submit_answer_stream(answer))
+
+    def _submit_answer_stream(self, answer: str) -> Iterator[tuple[str, object]]:
         state = self.current()
         judgement: Judgement | None = None
         for name, payload in judge_answer_stream(
@@ -277,13 +280,17 @@ class QuizSession:
         # ヒントは全文が出そろってから答え漏洩チェックを通す必要があるため、
         # 途中経過を UI に流せない（ストリーミング非対応のまま）
         state = self.current()
-        hint, leaks = generate_hint(
-            self._llm,
-            self._kb,
-            state.question,
-            user_answer="(未回答またはヒント要求)",
-            hint_level=state.hint_level,
-        )
+        try:
+            hint, leaks = generate_hint(
+                self._llm,
+                self._kb,
+                state.question,
+                user_answer="(未回答またはヒント要求)",
+                hint_level=state.hint_level,
+            )
+        except LLMUnavailableError as error:
+            self._end_unavailable(error)
+            raise
         state.interaction.hints_shown += 1
         state.interaction.max_hint_level = max(
             state.interaction.max_hint_level, state.hint_level
@@ -297,6 +304,9 @@ class QuizSession:
 
     def give_up_stream(self) -> Iterator[tuple[str, object]]:
         """ギブアップ処理。イベント仕様は submit_answer_stream と同じ。"""
+        return self._guard(self._give_up_stream())
+
+    def _give_up_stream(self) -> Iterator[tuple[str, object]]:
         state = self.current()
         state.interaction.gave_up = True
         if state.interaction.first_verdict is None:
@@ -334,6 +344,37 @@ class QuizSession:
 
     # ---- 内部 ---------------------------------------------------------
 
+    def _guard(self, events: Iterator[tuple[str, object]]) -> Iterator[tuple[str, object]]:
+        """LLM が止まったらセッションを畳んでから呼び出し側へ例外を伝える。
+
+        セッションを畳まずに例外だけ投げると status が in_progress のまま残り、
+        それをポーリングしているフックが返らずコミットが固まる。
+        """
+        try:
+            yield from events
+        except LLMUnavailableError as error:
+            self._end_unavailable(error)
+            raise
+
+    def _end_unavailable(self, error: LLMUnavailableError) -> None:
+        """クイズ中に LLM が使えなくなったときの後始末（APIキー期限切れ等）。
+
+        キーの失効・レート制限は待っても次の呼び出しが成功しないので、続きを
+        出題せずここで終わらせる。aborted ではなく completed にするのは、
+        クイズがコミットを妨げないため（prepare_first の fail-open と同じ扱い）。
+        理由は error に載せ、UI が警告として表示する。
+        """
+        logger.warning(
+            "LLMが利用できないため理解度チェックを終了します: session=%s 解答済み=%d問 error=%s",
+            self.id,
+            self._index,
+            error,
+        )
+        self.error = str(error)
+        self._preparing = False
+        if self.status == "in_progress":
+            self.status = "completed"
+
     def _finish_question_stream(
         self, state: QuestionState
     ) -> Iterator[tuple[str, object]]:
@@ -365,4 +406,9 @@ class QuizSession:
     def report(self):
         from .evaluator import build_report
 
-        return build_report(self.interactions(), completed=self.status == "completed")
+        # completed は「最後の問題まで到達したか」。status だけで判断すると、
+        # LLM 停止で畳んだセッション（status=completed だが問題が残っている）を
+        # 完走として報告してしまう
+        return build_report(
+            self.interactions(), completed=self.status == "completed" and self.finished
+        )

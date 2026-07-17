@@ -71,12 +71,19 @@ class TavilySearch:
 
 
 class DuckDuckGoSearch:
+    # ddgs はメタ検索ライブラリで、backend の既定値 "auto" は text カテゴリの全エンジン
+    # （brave / google / startpage / yandex / yahoo / mojeek / wikipedia 等）に問い合わせる。
+    # 送信先は README の「外部に送信されるデータ」で申告している以上、既定に任せると
+    # 申告が実態と食い違う（利用者は DuckDuckGo だけのつもりで9社に送ることになる）。
+    # 送信先を1つに固定するため backend を明示する。
+    BACKEND = "duckduckgo"
+
     def search(self, query: str, max_results: int = 4) -> list[Chunk]:
         from ddgs import DDGS
 
         chunks = []
         with DDGS() as ddgs:
-            for item in ddgs.text(query, max_results=max_results):
+            for item in ddgs.text(query, max_results=max_results, backend=self.BACKEND):
                 body = item.get("body") or ""
                 if body:
                     chunks.append(
