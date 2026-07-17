@@ -3,15 +3,27 @@
 // このパネルが答えを先に知ることはない。
 
 import * as vscode from "vscode";
-import { AnswerResponse, BackendClient, StreamEvent } from "./backendClient";
+import {
+  AnswerResponse,
+  BackendClient,
+  LlmUnavailableError,
+  StreamEvent,
+} from "./backendClient";
 
 const QUESTION_POLL_MS = 700;
+
+// セッションの終わり方。Webview はこれを見て「コミットは続行/中止」まで伝える
+type Outcome = "completed" | "skipped" | "aborted" | "unavailable";
 
 export class QuizPanel {
   private static panels = new Map<string, QuizPanel>();
   private readonly panel: vscode.WebviewPanel;
   private finished = false;
   private disposed = false;
+  private claimed = false;
+  // 別ウィンドウが先にこのセッションを所有していた。閉じるときに abort しては
+  // いけない（所有者ウィンドウのコミットを巻き込んで中止させてしまう）
+  private claimLost = false;
 
   static show(client: BackendClient, sessionId: string): void {
     if (QuizPanel.panels.has(sessionId)) {
@@ -39,7 +51,7 @@ export class QuizPanel {
     this.panel.onDidDispose(async () => {
       this.disposed = true;
       QuizPanel.panels.delete(this.sessionId);
-      if (!this.finished) {
+      if (!this.finished && !this.claimLost) {
         try {
           await this.client.abort(this.sessionId);
         } catch {
@@ -54,6 +66,35 @@ export class QuizPanel {
 
   private post(message: unknown): void {
     void this.panel.webview.postMessage(message);
+  }
+
+  // 表示準備が整ってから所有権を取る。戻り値 true なら出題を続けてよい。
+  // 一度成功したら再要求（reload）では claim し直さない。
+  private async claimOwnership(): Promise<boolean> {
+    if (this.claimed) {
+      return true;
+    }
+    try {
+      const { ok } = await this.client.claim(this.sessionId);
+      if (!ok) {
+        // 別ウィンドウが先に所有。abort せずに静かに閉じる（claimLost）
+        this.claimLost = true;
+        this.post({
+          type: "error",
+          message: "このチェックは別のウィンドウで開いています。",
+        });
+        this.panel.dispose();
+        return false;
+      }
+      this.claimed = true;
+      return true;
+    } catch {
+      // claim に失敗（バックエンド一時不通等）。ここで止めるとフックが待ち続ける
+      // ので、所有できたものとみなして出題を進める（fail-open）。最悪でも同一
+      // ワークスペースを複数ウィンドウで開いた稀なケースで二重表示になるだけ
+      this.claimed = true;
+      return true;
+    }
   }
 
   private async loadQuestion(): Promise<void> {
@@ -90,6 +131,9 @@ export class QuizPanel {
       switch (message.type) {
         case "ready":
         case "reload": {
+          if (!(await this.claimOwnership())) {
+            break; // 別ウィンドウが所有。claimOwnership がパネルを閉じる
+          }
           await this.loadQuestion();
           break;
         }
@@ -130,12 +174,32 @@ export class QuizPanel {
         }
       }
     } catch (error) {
-      this.post({ type: "error", message: String(error) });
+      if (error instanceof LlmUnavailableError) {
+        await this.onUnavailable(error.message);
+      } else {
+        this.post({ type: "error", message: String(error) });
+      }
     }
+  }
+
+  // AI が使えなくなった（APIキーの期限切れ・レート制限など）。再試行しても
+  // 直らないので、警告を出してセッションを畳む。バックエンドは既にセッションを
+  // 終了させているため、フックはコミットを続行できる（クイズはコミットを妨げない）。
+  private async onUnavailable(message: string, status?: string): Promise<void> {
+    void vscode.window.showWarningMessage(`QQQuestionAI: ${message}`);
+    this.post({ type: "error", message });
+    await this.completeSession(status, "unavailable");
   }
 
   private onStreamEvent(event: StreamEvent): void {
     switch (event.event) {
+      case "error":
+        // AI 停止の終端イベント。これ以上 result は来ない
+        void this.onUnavailable(
+          event.message ?? "AIサービスを利用できません。",
+          event.status
+        );
+        break;
       case "judgement_partial":
         this.post({ type: "stream_reason", reason: event.reason ?? "" });
         break;
@@ -178,7 +242,9 @@ export class QuizPanel {
     }
   }
 
-  private async completeSession(status?: string): Promise<void> {
+  // forcedOutcome は終わり方が呼び出し側にしか分からないとき（AI 停止）に渡す。
+  // レポートだけでは「途中でAIが死んだ」と「出題できなかった」を区別できない。
+  private async completeSession(status?: string, forcedOutcome?: Outcome): Promise<void> {
     this.finished = true;
     try {
       const report = await this.client.report(this.sessionId);
@@ -186,12 +252,13 @@ export class QuizPanel {
       // attempted=0（生成失敗でスキップ）や aborted（中断→コミット中止）を
       // 「完走」と表示していたのが、リザルトが最初に出て見えた誤表示の元。
       const sessionStatus = status ?? report.status;
-      const outcome: "completed" | "skipped" | "aborted" =
-        sessionStatus === "aborted"
+      const outcome: Outcome =
+        forcedOutcome ??
+        (sessionStatus === "aborted"
           ? "aborted"
           : report.attempted > 0 && report.completed
             ? "completed"
-            : "skipped";
+            : "skipped");
       this.post({ type: "report", rendered: report.rendered, outcome });
     } catch (error) {
       this.post({ type: "error", message: String(error) });
@@ -391,6 +458,10 @@ function renderHtml(): string {
       if (message.outcome === "aborted") {
         addEntry("incorrect", message.rendered
           + "\\n理解度チェックが中断されました。コミットは中止されます。");
+      } else if (message.outcome === "unavailable") {
+        addEntry("partial", message.rendered
+          + "\\nAIサービスを利用できなくなったため理解度チェックを終了しました。コミットは続行します。"
+          + "\\nAPIキーの期限切れ・利用上限の可能性があります。上のエラー内容をご確認ください。");
       } else if (message.outcome === "skipped") {
         addEntry("partial", message.rendered
           + "\\n出題できなかったため理解度チェックをスキップしました。コミットは続行します。");

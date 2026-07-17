@@ -118,11 +118,34 @@ def test_hint_and_giveup_via_api(client):
     assert response["next_question"]["number"] == 2
 
 
-def test_pending_claims_once(client):
+def test_pending_is_read_only_until_claimed(client):
+    """GET /quiz/pending は副作用なし。claim するまで何度でも同じものを返す。
+
+    旧実装は GET で claim していたため、claim 後に応答を落とすとセッションが
+    誰にも配られず、タイムアウトの無いフックが無限待機してコミットが固まった。
+    読み取り専用にしたことで、応答を取りこぼしても次の周回で再掲される。
+    """
     session_id = _start(client)
     first = client.get("/quiz/pending").json()["sessions"]
     assert [s["session_id"] for s in first] == [session_id]
-    assert client.get("/quiz/pending").json()["sessions"] == []  # 二重表示しない
+    # もう一度読んでも消えない（応答取りこぼしからの回復に必要）
+    again = client.get("/quiz/pending").json()["sessions"]
+    assert [s["session_id"] for s in again] == [session_id]
+
+
+def test_claim_removes_from_pending_and_is_first_wins(client):
+    session_id = _start(client)
+
+    won = client.post(f"/quiz/{session_id}/claim").json()
+    assert won == {"ok": True}
+    # claim 後は一覧から消える（このパネルが所有した）
+    assert client.get("/quiz/pending").json()["sessions"] == []
+    # 二人目の claim は先着に負ける（別ウィンドウは abort せず閉じるための合図）
+    assert client.post(f"/quiz/{session_id}/claim").json() == {"ok": False}
+
+
+def test_claim_unknown_session_is_404(client):
+    assert client.post("/quiz/nope/claim").status_code == 404
 
 
 def _start_in(client, repo_path: str) -> str:
@@ -188,6 +211,79 @@ def test_pending_grace_fallback_when_no_window_matches(client, tmp_path, monkeyp
         "sessions"
     ]
     assert [s["session_id"] for s in claimed] == [session_id]
+
+
+def _start_with_origin(client, repo_path: str, origin: str) -> str:
+    response = client.post(
+        "/quiz/start", json={"repo_path": repo_path, "origin": origin}
+    )
+    assert response.status_code == 200
+    return response.json()["session_id"]
+
+
+def test_pending_skips_cli_origin(client, tmp_path):
+    """端末の quiz にパネルを開かない（端末で解答中に横からパネルが出て、
+    それを閉じると abort でセッションが死ぬのを防ぐ）。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _start_with_origin(client, str(repo), "cli")
+
+    assert (
+        client.get("/quiz/pending", params={"workspace": str(repo)}).json()["sessions"]
+        == []
+    )
+
+
+def test_pending_skips_ui_origin(client, tmp_path):
+    """拡張のコマンド起点も、呼び出し元が自分でパネルを開くので載せない。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _start_with_origin(client, str(repo), "ui")
+
+    assert (
+        client.get("/quiz/pending", params={"workspace": str(repo)}).json()["sessions"]
+        == []
+    )
+
+
+def test_pending_grace_fallback_does_not_leak_non_hook_origin(
+    client, tmp_path, monkeypatch
+):
+    """ワークスペース不一致時の保険（猶予後は誰でも拾う）が、cli 起点まで
+    拾い直してしまわないこと。"""
+    import qqquestion.server as server
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    _start_with_origin(client, str(repo), "cli")
+
+    monkeypatch.setattr(server, "PENDING_GRACE_SECONDS", -1.0)
+    assert (
+        client.get("/quiz/pending", params={"workspace": str(unrelated)}).json()[
+            "sessions"
+        ]
+        == []
+    )
+
+
+def test_pending_defaults_to_hook_for_clients_without_origin(client, tmp_path):
+    """origin を送らない旧クライアント（旧フック）は従来どおりパネルが開く。
+    フックはパネルが開かないとコミット待ちのまま固まるため、既定は hook 側に倒す。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session_id = _start_in(client, str(repo))  # origin 無しの POST
+
+    claimed = client.get("/quiz/pending", params={"workspace": str(repo)}).json()[
+        "sessions"
+    ]
+    assert [s["session_id"] for s in claimed] == [session_id]
+
+
+def test_unknown_origin_is_rejected(client):
+    response = client.post("/quiz/start", json={"repo_path": ".", "origin": "nope"})
+    assert response.status_code == 422
 
 
 def test_abort_via_api(client):

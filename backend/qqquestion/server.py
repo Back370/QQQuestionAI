@@ -1,8 +1,9 @@
 """FastAPI ローカルサーバ（architecture.md §3）。
 
 - git pre-commit フック: POST /quiz/start → GET /quiz/{sid}/status をポーリング
-- VSCode 拡張: GET /quiz/pending をポーリングして新規セッションを拾い、
-  Webview から answer / hint / giveup / abort を叩く
+- VSCode 拡張: GET /quiz/pending をポーリングしてフック起点のセッションを拾い、
+  Webview から answer / hint / giveup / abort を叩く（フックは自前の UI を
+  持たないため、この経路でしか出題できない）
 - 127.0.0.1 のみで待ち受ける。模範解答は問題が終わるまでレスポンスに含めない
 """
 
@@ -17,8 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import diff_analyzer
@@ -29,11 +30,15 @@ from .knowledge_base import (
     create_search_provider,
 )
 from .learner_model import HistoryStore, load_learner_state
-from .llm import StructuredLLM, create_llm
-from .models import DiffContext
+from .llm import LLMUnavailableError, StructuredLLM, create_llm
+from .models import DiffContext, QuizOrigin
 from .session import QuizSession
 
 DEFAULT_PORT = 8756
+
+# LLM(API) が使えないときに返すステータス。UI はこれを「復旧しない失敗」として
+# 扱い、警告を出してクイズを畳む（500 と違い、内容は利用者向けの日本語）
+LLM_UNAVAILABLE_STATUS = 503
 
 # セッションの repo_path がどのウィンドウのワークスペースにも一致しないまま
 # この秒数を過ぎたら、取りこぼし防止のためどのウィンドウでも拾えるようにする
@@ -84,6 +89,10 @@ def default_deps() -> AppDeps:
 
 class StartRequest(BaseModel):
     repo_path: str = "."
+    # 既定を "hook" にするのは後方互換のため。origin を送らない旧クライアントは
+    # 旧フックの可能性があり、パネルが開かないとコミットが進まず固まる。誤って
+    # パネルが開くほうが、待ち続けて固まるより安全（従来の挙動と同じ）。
+    origin: QuizOrigin = "hook"
 
 
 class AnswerRequest(BaseModel):
@@ -154,23 +163,45 @@ def _sse_response(session: QuizSession, events: Iterator[tuple[str, object]]):
     """
 
     def generate() -> Iterator[str]:
-        for name, payload in events:
-            if name == "result":
-                data = _answer_payload(payload)
-                data["next_question"] = session.current_public()
-                data["status"] = session.status
-                yield _sse("result", data)
-            elif name == "judgement":
-                done = payload["question_done"]  # type: ignore[index]
-                data = {
-                    "judgement": _public_judgement(payload["judgement"], done),  # type: ignore[index]
-                    "question_done": done,
-                }
-                if done:
-                    data["model_answer"] = payload["model_answer"]  # type: ignore[index]
-                yield _sse("judgement", data)
-            else:  # judgement_partial / explanation_partial
-                yield _sse(name, payload)  # type: ignore[arg-type]
+        # ストリーム途中の例外は、ヘッダ送出済み(200)の接続が黙って切れるだけに
+        # なり、クライアントは result を待ち続ける（＝パネルが固まる）。どんな
+        # 失敗でも error イベントで終端させ、理由を UI に届ける
+        try:
+            for name, payload in events:
+                if name == "result":
+                    data = _answer_payload(payload)
+                    data["next_question"] = session.current_public()
+                    data["status"] = session.status
+                    yield _sse("result", data)
+                elif name == "judgement":
+                    done = payload["question_done"]  # type: ignore[index]
+                    data = {
+                        "judgement": _public_judgement(payload["judgement"], done),  # type: ignore[index]
+                        "question_done": done,
+                    }
+                    if done:
+                        data["model_answer"] = payload["model_answer"]  # type: ignore[index]
+                    yield _sse("judgement", data)
+                else:  # judgement_partial / explanation_partial
+                    yield _sse(name, payload)  # type: ignore[arg-type]
+        except LLMUnavailableError as error:
+            # セッションは session 側で畳み済み（status=completed）。UI は理由を
+            # 警告として出し、レポートを表示して終われる
+            logger.warning(
+                "ストリーム中にAIが利用不能になりました: session=%s error=%s",
+                session.id,
+                error,
+            )
+            yield _sse("error", {"message": str(error), "status": session.status})
+        except Exception as error:
+            logger.exception("ストリームの処理に失敗しました: session=%s", session.id)
+            yield _sse(
+                "error",
+                {
+                    "message": f"応答の生成に失敗しました: {error}",
+                    "status": session.status,
+                },
+            )
 
     return StreamingResponse(
         generate(),
@@ -198,13 +229,31 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
         deps = default_deps()
     app.state.deps = deps
 
+    @app.exception_handler(LLMUnavailableError)
+    async def llm_unavailable(request: Request, error: LLMUnavailableError) -> JSONResponse:
+        """AI が使えない失敗を、利用者向けの理由付き 503 として返す。
+
+        これが無いと 500 + 生スタックになり、UI には「HTTP 500」としか出ない。
+        セッションは session 側で畳まれているので、UI はこの detail を警告に
+        出してレポートへ進める。
+        """
+        logger.warning(
+            "AIが利用できないため %d を返します: path=%s error=%s",
+            LLM_UNAVAILABLE_STATUS,
+            request.url.path,
+            error,
+        )
+        return JSONResponse(
+            status_code=LLM_UNAVAILABLE_STATUS, content={"detail": str(error)}
+        )
+
     @app.get("/health")
     def health():
         return {"status": "ok", "kb_chunks": deps.kb.count()}
 
     @app.post("/quiz/start")
     def start(request: StartRequest):
-        logger.info("クイズ開始要求: repo=%s", request.repo_path)
+        logger.info("クイズ開始要求: repo=%s origin=%s", request.repo_path, request.origin)
         diff_ctx = deps.diff_provider(request.repo_path)
         if not diff_ctx.diff_text.strip():
             logger.warning("ステージ済みの差分が無いため 400 を返します: repo=%s", request.repo_path)
@@ -218,10 +267,15 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
             history_store=HistoryStore(deps.history_path),
             defer_questions=True,
             repo_path=os.path.abspath(request.repo_path),
+            origin=request.origin,
         )
         # 生成前にセッションを公開する: 拡張の /quiz/pending ポーリングが即座に
         # 拾ってパネルを開き、「生成中」を表示できる
         deps.sessions[session.id] = session
+        # 猶予フォールバックの起点は「生成時刻」で固定する。/quiz/pending を
+        # 読み取り専用に保つため、GET 側では pending_since を書き込まない
+        if session.origin == "hook":
+            deps.pending_since[session.id] = time.monotonic()
         # 第1問だけ同期生成して即出題する。残り4問と知識ベース構築（Web検索）は
         # バックグラウンドに回し、第1問の解答中に進める
         session.prepare_first(fail_open=True)
@@ -264,42 +318,70 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
 
     @app.get("/quiz/pending")
     def pending(workspace: list[str] = Query(default=[])):
-        """UI が未表示のセッション一覧。返したものは claimed 扱いにする。
+        """パネルを開いてほしいセッション一覧を返す（読み取り専用）。
+
+        **副作用なし。** 一覧に載せても claim しない。実際に表示できたパネルが
+        POST /quiz/{id}/claim で所有権を取るまで、同じセッションを何度でも返す。
+        こうすることで応答を取りこぼしてもコミットが固まらない（旧実装は GET で
+        claim していたため、claim 後に応答を落とすとセッションが誰にも配られず、
+        タイムアウトの無いフックが in_progress のまま無限待機した）。同一
+        セッションが連続で返っても QuizPanel.show が sessionId で重複排除する。
+
+        返すのは origin="hook" のセッションだけ。フックは curl のシェル
+        スクリプトで自前の UI を持たず、拡張にパネルを開いてもらう以外に
+        出題する手段がないため、このポーリングがフックから VSCode への唯一の
+        通知経路になっている。一方 cli（端末の quiz）と ui（拡張のコマンド）は
+        既に自分の UI で出題しているので、ここで返すと二重表示になる。
 
         複数の VSCode ウィンドウが同じバックエンドを共有するため、コミットが
         走ったリポジトリ（session.repo_path）を、ポーリング元ウィンドウの
         ワークスペース（workspace クエリ）と突き合わせ、担当ウィンドウにだけ
         返す。これで別ウィンドウにクイズパネルが開く問題を防ぐ。
-        workspace 未指定（旧拡張）のときは従来どおり即 claim する。
+        workspace 未指定（旧拡張）のときは全ウィンドウに返す。
         """
         found: list[dict] = []
         workspaces = [_normalize_path(w) for w in workspace]
         now = time.monotonic()
 
-        def claim(session: QuizSession) -> None:
-            deps.claimed.add(session.id)
-            deps.pending_since.pop(session.id, None)
-            found.append(
-                {
-                    "session_id": session.id,
-                    "topics": session.diff_ctx.topics,
-                    "files": session.diff_ctx.files,
-                    "total": session.total,
-                }
-            )
+        def as_entry(session: QuizSession) -> dict:
+            return {
+                "session_id": session.id,
+                "topics": session.diff_ctx.topics,
+                "files": session.diff_ctx.files,
+                "total": session.total,
+            }
 
         for session in deps.sessions.values():
             if session.status != "in_progress" or session.id in deps.claimed:
                 continue
+            if session.origin != "hook":
+                continue  # cli / ui は自前の UI で出題済み。パネルを開かない
             if not workspaces or _repo_matches_workspaces(session.repo_path, workspaces):
-                claim(session)
+                found.append(as_entry(session))
                 continue
             # このウィンドウの担当ではない。担当ウィンドウが猶予内に拾えなければ
-            # （パス不一致・対象リポジトリが未オープン等）取りこぼし防止で誰でも拾う
-            first_seen = deps.pending_since.setdefault(session.id, now)
+            # （パス不一致・対象リポジトリが未オープン等）取りこぼし防止で誰でも拾う。
+            # 起点時刻は start() で記録済みなので、ここでは読むだけ（GET は副作用なし）
+            first_seen = deps.pending_since.get(session.id, now)
             if now - first_seen >= PENDING_GRACE_SECONDS:
-                claim(session)
+                found.append(as_entry(session))
         return {"sessions": found}
+
+    @app.post("/quiz/{session_id}/claim")
+    def claim(session_id: str):
+        """パネルが表示準備完了後に所有権を取る。冪等かつ先着。
+
+        ポーリングの GET から claim を切り離したことで、この POST が「どの
+        パネルがこのセッションを出すか」を確定させる唯一の地点になる。
+        ok=true: この呼び出しで未claim→claimed に遷移（このパネルが所有）。
+        ok=false: 既に別パネル（別ウィンドウ）が所有済み。呼び出し側はパネルを
+        閉じるが、その際に abort してはいけない（所有者のコミットを巻き込むため）。
+        """
+        _session_or_404(deps, session_id)
+        won = session_id not in deps.claimed
+        deps.claimed.add(session_id)
+        deps.pending_since.pop(session_id, None)
+        return {"ok": won}
 
     @app.get("/quiz/{session_id}/status")
     def status(session_id: str):
@@ -374,6 +456,9 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
         session_report = session.report()
         return {
             "status": session.status,
+            # 完走しなかった理由（出題失敗・クイズ中のAI停止）。フックと拡張が
+            # 「スキップ/中断」の理由として利用者に見せる
+            "error": session.error,
             "report": {
                 "attempted": session_report.attempted,
                 "first_correct_rate": session_report.first_correct_rate,

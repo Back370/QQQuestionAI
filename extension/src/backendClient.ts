@@ -37,7 +37,8 @@ export interface AnswerResponse {
 }
 
 // /answer/stream, /giveup/stream (SSE) の1イベント。
-// event: "judgement_partial" | "judgement" | "explanation_partial" | "result"
+// event: "judgement_partial" | "judgement" | "explanation_partial" | "result" | "error"
+// "error" は AI が使えなくなったときの終端イベント（message に利用者向けの理由）。
 export interface StreamEvent {
   event: string;
   reason?: string;
@@ -47,12 +48,40 @@ export interface StreamEvent {
   model_answer?: string;
   next_question?: PublicQuestion | null;
   status?: string;
+  message?: string;
 }
+
+// バックエンドの AI が使えない (HTTP 503)。キーの失効・レート制限・モデル提供終了
+// など、待っても直らない失敗なので、呼び出し側は再試行せず警告を出して畳む。
+// message はバックエンドが分類した日本語で、そのまま利用者に見せられる。
+export class LlmUnavailableError extends Error {}
 
 // 通常エンドポイント（DB/メモリ参照のみ）の応答待ちタイムアウト
 const DEFAULT_TIMEOUT_MS = 10_000;
 // LLM 呼び出しを伴うエンドポイントは生成に時間がかかるため長めに待つ
 const LLM_TIMEOUT_MS = 60_000;
+// ポーリングは 1.5 秒ごとに繰り返すので、ハングしたバックエンドを 10 秒待つと
+// 呼び出しが積み上がる。次の周回で取り返せるので短く諦める
+const POLL_TIMEOUT_MS = 2_000;
+
+// 失敗レスポンスを例外に変換する。503（AI が使えない）だけは、バックエンドが
+// 作った日本語の detail をそのまま警告に使えるよう専用の型で返す。
+async function failureOf(path: string, response: Response): Promise<Error> {
+  const body = await response.text();
+  if (response.status === 503) {
+    return new LlmUnavailableError(detailOf(body) ?? body);
+  }
+  return new Error(`${path} -> HTTP ${response.status}: ${body}`);
+}
+
+function detailOf(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown };
+    return typeof parsed.detail === "string" ? parsed.detail : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export class BackendClient {
   constructor(private readonly port: number) {}
@@ -90,7 +119,7 @@ export class BackendClient {
   ): Promise<T> {
     const response = await this.fetchWithTimeout(path, init, timeoutMs);
     if (!response.ok) {
-      throw new Error(`${path} -> HTTP ${response.status}: ${await response.text()}`);
+      throw await failureOf(path, response);
     }
     return (await response.json()) as T;
   }
@@ -104,13 +133,51 @@ export class BackendClient {
     }
   }
 
+  // クイズを開始する（コミットとは無関係。結果がコミットを左右することはない）。
+  // 第1問はサーバ側で同期生成されるため、LLM 相当の待ち時間を見込む。
+  start(repoPath: string): Promise<{
+    session_id: string;
+    topics: string[];
+    files: string[];
+    total: number;
+    error?: string | null;
+  }> {
+    return this.request(
+      "/quiz/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // origin="ui": 呼び出し元（startQuiz）が自分でパネルを開くので、
+        // /quiz/pending のポーリングには載せない
+        body: JSON.stringify({ repo_path: repoPath, origin: "ui" }),
+      },
+      LLM_TIMEOUT_MS
+    );
+  }
+
   // このウィンドウのワークスペースパスを渡し、コミットが走ったリポジトリと
   // 一致するセッションだけ受け取る（別ウィンドウでパネルが開くのを防ぐ）。
+  // バックエンド未起動なら例外になるので、呼び出し側の health 確認は要らない。
   pending(workspaces: string[] = []): Promise<{ sessions: PendingSession[] }> {
     const query = workspaces
       .map((w) => `workspace=${encodeURIComponent(w)}`)
       .join("&");
-    return this.request(`/quiz/pending${query ? `?${query}` : ""}`);
+    return this.request(
+      `/quiz/pending${query ? `?${query}` : ""}`,
+      undefined,
+      POLL_TIMEOUT_MS
+    );
+  }
+
+  // パネルが表示準備を終えた後に所有権を取る。GET /quiz/pending は読み取り専用で
+  // 何度でも同じセッションを返すため、実際に開けたパネルがこの POST で claim して
+  // 初めて一覧から外れる。ok=false は別ウィンドウが先に所有した合図。
+  claim(sessionId: string): Promise<{ ok: boolean }> {
+    return this.request(
+      `/quiz/${sessionId}/claim`,
+      { method: "POST" },
+      POLL_TIMEOUT_MS
+    );
   }
 
   question(sessionId: string): Promise<{
@@ -164,7 +231,7 @@ export class BackendClient {
     // ボディは LLM の逐次生成で長時間続きうるため、受信開始後は打ち切らない
     const response = await this.fetchWithTimeout(path, init, DEFAULT_TIMEOUT_MS);
     if (!response.ok) {
-      throw new Error(`${path} -> HTTP ${response.status}: ${await response.text()}`);
+      throw await failureOf(path, response);
     }
     if (!response.body) {
       throw new Error(`${path} -> 空のレスポンスボディ`);
@@ -172,6 +239,7 @@ export class BackendClient {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let terminated = false;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) {
@@ -183,9 +251,18 @@ export class BackendClient {
         const raw = buffer.slice(0, boundary).trim();
         buffer = buffer.slice(boundary + 2);
         if (raw.startsWith("data: ")) {
-          onEvent(JSON.parse(raw.slice("data: ".length)) as StreamEvent);
+          const event = JSON.parse(raw.slice("data: ".length)) as StreamEvent;
+          terminated = terminated || event.event === "result" || event.event === "error";
+          onEvent(event);
         }
       }
+    }
+    // ヘッダ送出後にバックエンドが落ちると、接続が切れるだけで終端イベントが
+    // 来ない。呼び出し側は待つのをやめられず固まるので、ここで失敗にする
+    if (!terminated) {
+      throw new Error(
+        `${path} -> 応答が途中で切れました。バックエンドの出力（QQQuestionAI）を確認してください。`
+      );
     }
   }
 

@@ -1,0 +1,16 @@
+{
+  // F5 で拡張開発ホストを起動するための構成。これが無いと F5 は「開いているファイルを
+  // デバッグ」にフォールバックし、package.json を開いていると JSON デバッガを要求される。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "拡張機能を実行 (Extension Development Host)",
+      "type": "extensionHost",
+      "request": "launch",
+      // 拡張の実体はリポジトリ直下ではなく extension/ にある
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/extension"],
+      "outFiles": ["${workspaceFolder}/extension/out/**/*.js"],
+      "preLaunchTask": "compile-extension"
+    }
+  ]
+}

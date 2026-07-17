@@ -1,10 +1,27 @@
-# テンプレート自身の依存更新。現状の依存はGitHub Actionsのみ
-# （CIで使うactionのSHA固定を最新に追従させる）。
-# 派生プロジェクトでは、使うエコシステム（npm / pip 等）のエントリを追加すること
-# （雛形: .claude/skills/claude-project-setup/references/ci-workflow-examples.md）。
+# 依存更新の自動追従。放置すると既知の脆弱性を抱えたまま配布し続けることになるので、
+# 出てきた PR は project-health-check の対象として定期的に棚卸しすること。
+#
+# 重要: backend/requirements.txt の更新は、マージしただけでは利用者に届かない。
+# 拡張の新バージョンを publish して初めて各自の venv が作り直される（依存の指紋が
+# 変わったときだけ再インストールされる仕組み: extension/src/extension.ts の bootstrapVenv）。
 version: 2
 updates:
+  # CIで使うactionのSHA固定を最新に追従させる。
   - package-ecosystem: github-actions
     directory: /
+    schedule:
+      interval: weekly
+
+  # 利用者のマシンに実際に入るバックエンド依存（requirements.txt の == 固定）と、
+  # 開発用の pyproject.toml。ここが配布物のセキュリティ上の主戦場。
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+
+  # 拡張のビルド依存（TypeScript・型定義）。現状 dependencies は無く devDependencies
+  # だけなので、利用者に配られるコードには入らない＝実行時リスクは低い。
+  - package-ecosystem: npm
+    directory: /extension
     schedule:
       interval: weekly

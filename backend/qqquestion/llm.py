@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Iterator, Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -24,8 +25,11 @@ T = TypeVar("T", bound=BaseModel)
 #   ("final", BaseModel)   — 検証済みの最終結果。必ず最後に1回だけ流れる
 StreamEvent = tuple[str, object]
 
-# gemini-2.0-flash は無料枠の割り当てが終了している(429 limit:0)ため 2.5 を既定にする
-DEFAULT_MODEL = "gemini-2.5-flash"
+# 既定モデル。Google は退役したモデルを「新規プロジェクトからは 404」にして段階的に
+# 閉じるため、既定値が古いと"新しくAPIキーを取った人だけ"が壊れる（既存キーでは再現
+# しない）。過去 2.0→2.5→3.5 と踏んでいるので、404 は _classify_llm_error が
+# QQQ_MODEL での回避を案内できるようにしてある。
+DEFAULT_MODEL = "gemini-3.5-flash"
 
 # 1回のLLM呼び出しの応答待ち上限（秒）。これを超えると打ち切って例外にする。
 # タイムアウトが無いと、API無応答・レート制限のリトライ待ちで prepare_first() が
@@ -57,13 +61,25 @@ def _llm_timeout() -> float:
         return DEFAULT_TIMEOUT
 
 
+def _current_model_name() -> str:
+    return os.environ.get("QQQ_MODEL", DEFAULT_MODEL)
+
+
+def _is_model_missing_error(error: Exception) -> bool:
+    """モデルが存在しない/提供終了で使えない失敗か（404 NOT_FOUND）。"""
+    text = str(error).lower()
+    return "404" in text or "not_found" in text or "not found" in text
+
+
 def _is_unavailable_error(error: Exception) -> bool:
-    """API そのものが使えない失敗（タイムアウト・レート制限・認証）か。
+    """API そのものが使えない失敗（タイムアウト・レート制限・認証・モデル不在）か。
 
     これらは速度優先の generate_fast から通常経路へフォールバックしても直らない
     ので、二重待ちを避けて即座に伝える判断に使う。
     """
     if isinstance(error, TimeoutError):
+        return True
+    if _is_model_missing_error(error):
         return True
     text = str(error).lower()
     keywords = (
@@ -71,6 +87,20 @@ def _is_unavailable_error(error: Exception) -> bool:
         "api key", "api_key", "unauthenticated", "permission", "401", "403",
     )
     return any(word in text for word in keywords)
+
+
+def _fast_thinking_kwargs(model_name: str) -> dict[str, object]:
+    """速度優先時に thinking を最小化する ChatGoogleGenerativeAI の引数。
+
+    Gemini 3 以降は thinking_budget を受け付けず、thinking_level（最小でも
+    "minimal"、完全な無効化は不可）で制御する。世代を見ずに thinking_budget=0 を
+    送ると API に弾かれ、失敗する往復を1回挟んでから通常生成へ落ちるため、
+    速度優先のはずが逆に遅くなる。
+    """
+    match = re.match(r"gemini-(\d+)", model_name)
+    if match and int(match.group(1)) >= 3:
+        return {"thinking_level": "minimal"}
+    return {"thinking_budget": 0}
 
 
 def _classify_llm_error(error: Exception) -> str:
@@ -95,6 +125,12 @@ def _classify_llm_error(error: Exception) -> str:
         or "403" in text
     ):
         return "APIキーが無効か権限がありません。GOOGLE_API_KEY を確認してください。"
+    if _is_model_missing_error(error):
+        return (
+            f"AIモデル「{_current_model_name()}」が使えません（提供終了か名前の誤り）。"
+            "環境変数 QQQ_MODEL に現行のモデル名を設定して再試行してください。"
+            "使えるモデルは https://ai.google.dev/gemini-api/docs/models で確認できます。"
+        )
     return f"AIサービスの呼び出しに失敗しました: {error}"
 
 
@@ -110,7 +146,7 @@ class GeminiLLM:
     """LangChain 経由の Gemini 実装（architecture.md §2）。"""
 
     def __init__(self, model: str | None = None):
-        self._model_name = model or os.environ.get("QQQ_MODEL", DEFAULT_MODEL)
+        self._model_name = model or _current_model_name()
         # APIキーの検査は呼び出し時に遅延させる。起動時に例外を投げると
         # サーバが立ち上がらず、ユーザーに何も表示できないまま静かにスキップに
         # なるため。呼び出し時に LLMUnavailableError を投げれば、fail-open 経路が
@@ -158,21 +194,22 @@ class GeminiLLM:
     def generate_fast(
         self, schema: type[T], system: str, user: str, temperature: float = 0.0
     ) -> T:
-        """thinking を無効化した速度優先の生成（実測で約6.9秒→2.9秒）。
+        """thinking を最小化した速度優先の生成（実測で約6.9秒→2.9秒）。
 
         第1問の先行生成など、体感待ち時間が最重要の呼び出しで使う。
-        thinking_budget 非対応のモデル・ライブラリでは通常の generate に
-        フォールバックする。ただし API 自体が使えない（キー無し・タイムアウト・
-        レート制限）場合はフォールバックしても同じく失敗するため、そのまま
-        LLMUnavailableError を投げて二重待ちを避ける。
+        パラメータはモデル世代で異なる（_fast_thinking_kwargs 参照）。非対応の
+        モデル・ライブラリでは通常の generate にフォールバックする。ただし API
+        自体が使えない（キー無し・タイムアウト・レート制限・モデル提供終了）場合は
+        フォールバックしても同じく失敗するため、そのまま LLMUnavailableError を
+        投げて二重待ちを避ける。
         """
         self._require_key()
         from langchain_core.messages import HumanMessage, SystemMessage
 
         try:
-            chat = self._chat(temperature, thinking_budget=0).with_structured_output(
-                schema
-            )
+            chat = self._chat(
+                temperature, **_fast_thinking_kwargs(self._model_name)
+            ).with_structured_output(schema)
             result = chat.invoke(
                 [SystemMessage(content=system), HumanMessage(content=user)]
             )
@@ -183,7 +220,7 @@ class GeminiLLM:
             raise
         except Exception as error:
             # API の利用不能はフォールバックしても直らないので即座に伝える。
-            # それ以外（thinking_budget 非対応など）は通常経路で作り直す。
+            # それ以外（thinking パラメータ非対応など）は通常経路で作り直す。
             if _is_unavailable_error(error):
                 logger.warning(
                     "LLM呼び出し(fast)に失敗: model=%s schema=%s error=%r",
