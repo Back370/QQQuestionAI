@@ -1,8 +1,9 @@
 import { defineConfig } from "vitest/config";
 
-// component test: jsdom + esbuild automatic JSX(tsconfig の jsx:preserve は Next 用なので上書き)。
+// component test: jsdom + automatic JSX。vitest 4 の変換器は esbuild ではなく oxc なので、
+// jsx は oxc 側で明示する(tsconfig 依存にすると jsx 設定の変更でテストだけ壊れる)。
 export default defineConfig({
-  esbuild: { jsx: "automatic" },
+  oxc: { jsx: { runtime: "automatic" } },
   test: {
     environment: "jsdom",
     globals: true,

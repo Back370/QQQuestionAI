@@ -14,19 +14,22 @@
     "e2e": "playwright test"
   },
   "dependencies": {
-    "next": "^14.2.15",
+    "next": "^16.2.10",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
+  "overrides": {
+    "postcss": "^8.5.10"
+  },
   "devDependencies": {
-    "typescript": "^5.6.3",
+    "@playwright/test": "^1.48.2",
+    "@testing-library/jest-dom": "^6.6.2",
+    "@testing-library/react": "^16.0.1",
+    "@types/node": "^20.14.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "@types/node": "^20.14.0",
-    "vitest": "^2.1.4",
     "jsdom": "^25.0.1",
-    "@testing-library/react": "^16.0.1",
-    "@testing-library/jest-dom": "^6.6.2",
-    "@playwright/test": "^1.48.2"
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
   }
 }
