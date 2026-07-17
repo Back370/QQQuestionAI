@@ -1,0 +1,9 @@
+# web 単体(backend は各スタックの compose で起動し、NEXT_PUBLIC_API_BASE で繋ぐ)
+services:
+  web:
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_API_BASE: "http://localhost:8000"
+    ports:
+      - "3000:3000"

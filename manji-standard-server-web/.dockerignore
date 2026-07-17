@@ -1,0 +1,4 @@
+# ホストの実行環境をイメージに持ち込まない(COPY . . が node_modules/.next を上書きする事故防止)
+node_modules
+.next
+tsconfig.tsbuildinfo

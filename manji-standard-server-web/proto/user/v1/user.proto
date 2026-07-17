@@ -1,0 +1,151 @@
+syntax = "proto3";
+
+package user.v1;
+
+// @entity
+message User {
+  // @pk @paging
+  string id = 1;
+  // @unique @email
+  string email = 2;
+  // @required
+  string name = 3;
+  // @timestamp
+  int64 created_at_unix = 4;
+}
+
+// CreateUserParams は BulkCreateUsers の入力 1 件分。
+// rpc 派生の <Method>Input と衝突しないように "Params" 接尾辞を使う。
+message CreateUserParams {
+  string email = 1;
+  string name = 2;
+}
+
+// UpsertUserParams は BulkUpsertUsers の入力 1 件分。
+message UpsertUserParams {
+  string id = 1;
+  string email = 2;
+  string name = 3;
+  int64 created_at_unix = 4;
+}
+
+message ListUsersRequest {}
+message ListUsersResponse {
+  repeated User users = 1;
+}
+
+// ListUsersByCursorRequest は cursor pagination の入力。
+// after_id が空のときは先頭ページ、非空なら指定 id より後のレコードを limit 件返す。
+message ListUsersByCursorRequest {
+  int32 limit = 1;
+  string after_id = 2;
+}
+message ListUsersByCursorResponse {
+  repeated User users = 1;
+}
+
+message GetUserRequest {
+  string id = 1;
+}
+message GetUserResponse {
+  User user = 1;
+}
+
+message GetUserByEmailRequest {
+  string email = 1;
+}
+message GetUserByEmailResponse {
+  User user = 1;
+}
+
+message CreateUserRequest {
+  string email = 1;
+  string name = 2;
+}
+message CreateUserResponse {
+  User user = 1;
+}
+
+message BulkCreateUsersRequest {
+  repeated CreateUserParams users = 1;
+}
+message BulkCreateUsersResponse {
+  repeated User users = 1;
+}
+
+message UpsertUserRequest {
+  string id = 1;
+  string email = 2;
+  string name = 3;
+  int64 created_at_unix = 4;
+}
+message UpsertUserResponse {
+  User user = 1;
+}
+
+message BulkUpsertUsersRequest {
+  repeated UpsertUserParams users = 1;
+}
+message BulkUpsertUsersResponse {
+  repeated User users = 1;
+}
+
+message UpdateUserRequest {
+  string id = 1;
+  string email = 2;
+  string name = 3;
+}
+message UpdateUserResponse {
+  User user = 1;
+}
+
+message DeleteUserRequest {
+  string id = 1;
+}
+message DeleteUserResponse {}
+
+message BulkDeleteUsersRequest {
+  repeated string ids = 1;
+}
+message BulkDeleteUsersResponse {}
+
+message DeleteAllUsersRequest {}
+message DeleteAllUsersResponse {}
+
+service UserService {
+  // @http GET /api/users
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+
+  // @http GET /api/users/cursor
+  rpc ListUsersByCursor(ListUsersByCursorRequest) returns (ListUsersByCursorResponse);
+
+  // @http GET /api/users/by-email
+  rpc GetUserByEmail(GetUserByEmailRequest) returns (GetUserByEmailResponse);
+
+  // @http GET /api/users/{id}
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+
+  // @http POST /api/users
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+
+  // @http POST /api/users/bulk
+  rpc BulkCreateUsers(BulkCreateUsersRequest) returns (BulkCreateUsersResponse);
+
+  // @http PUT /api/users/bulk
+  rpc BulkUpsertUsers(BulkUpsertUsersRequest) returns (BulkUpsertUsersResponse);
+
+  // @http PUT /api/users/{id}
+  rpc UpsertUser(UpsertUserRequest) returns (UpsertUserResponse);
+
+  // @http PATCH /api/users/{id}
+  rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+
+  // @http POST /api/users/bulk-delete
+  rpc BulkDeleteUsers(BulkDeleteUsersRequest) returns (BulkDeleteUsersResponse);
+
+  // @http DELETE /api/users/{id}
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+
+  // @http DELETE /api/users
+  rpc DeleteAllUsers(DeleteAllUsersRequest) returns (DeleteAllUsersResponse);
+}

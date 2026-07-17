@@ -1,0 +1,13 @@
+node_modules/
+.next/
+*.tsbuildinfo
+dist/
+
+# Next.js (auto-generated)
+next-env.d.ts
+
+# tests
+/coverage/
+/test-results/
+/playwright-report/
+/.playwright/

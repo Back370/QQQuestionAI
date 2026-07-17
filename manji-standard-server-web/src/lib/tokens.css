@@ -1,0 +1,94 @@
+/* design tokens — 全widgetと手書き画面はこの変数だけを参照する(生値のhex/pxを書かない)。
+   ライト/ダークは prefers-color-scheme で自動追従。
+
+   ★ここは「構造(変数名・スケール)」+「中立プレースホルダの色値」。
+   色 = ブランドはプロジェクトごとに傾向が変わるので、**アプリ側の brand.css で色値だけ上書きする**
+   (layout で tokens.css の後に brand.css を import)。widget/画面のコードは色を変えても無変更。
+   → REUSE.md #7 / frontend-design skill / KB [[selection-design-pattern]]「色で統一感を出す」。 */
+:root {
+  --font-sans: ui-sans-serif, system-ui, "Hiragino Sans", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* --- 色値(プレースホルダ: アプリの brand.css で上書き想定) --- */
+  /* surface / text — 中立グレー */
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --border: #e4e4e7;
+  --border-strong: #d4d4d8;
+  --text: #18181b;
+  --text-muted: #52525b;
+  --text-faint: #a1a1aa;
+
+  /* accent / semantic — 中立 */
+  --accent: #2563eb;
+  --accent-soft: #dbeafe;
+  --on-accent: #ffffff;
+  --ok: #16a34a;
+  --ok-soft: #dcfce7;
+  --warn: #d97706;
+  --warn-soft: #fef3c7;
+  --danger: #dc2626;
+  --danger-soft: #fee2e2;
+
+  /* --- 構造(型スケール/余白/角丸/影): 共有。ここはブランドで上書きしない --- */
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 15px;
+  --text-lg: 18px;
+  --text-xl: 22px;
+  --text-2xl: 26px;
+  --text-3xl: 32px;
+
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.05);
+  --shadow-md: 0 2px 8px rgb(0 0 0 / 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111113;
+    --surface: #1b1b1f;
+    --surface-2: #232327;
+    --border: #2e2e33;
+    --border-strong: #3f3f46;
+    --text: #f4f4f5;
+    --text-muted: #a1a1aa;
+    --text-faint: #6b6b74;
+    --accent: #60a5fa;
+    --accent-soft: #1e3a5f;
+    --on-accent: #0b1220;
+    --ok: #4ade80;
+    --ok-soft: #16341f;
+    --warn: #fbbf24;
+    --warn-soft: #3a2c0a;
+    --danger: #f87171;
+    --danger-soft: #3b1515;
+    --shadow-sm: none;
+    --shadow-md: none;
+  }
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  margin: 0;
+}
+
+input, textarea, select, button {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--accent);
+}

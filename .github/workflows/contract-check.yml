@@ -1,0 +1,23 @@
+name: contract-check
+
+# /proto(単一の真実)と各スタックの proto が一致しているか(言語option無視)を検査。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "proto/**"
+      - "manji-standard-server-*/proto/**"
+      - "scripts/check-contract.sh"
+      - ".github/workflows/contract-check.yml"
+  pull_request:
+    paths:
+      - "proto/**"
+      - "manji-standard-server-*/proto/**"
+      - "scripts/check-contract.sh"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-contract.sh

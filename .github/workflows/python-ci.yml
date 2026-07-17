@@ -1,0 +1,93 @@
+name: python-ci
+
+# GitHub Actions は repo root の .github/workflows のみ実行するため、
+# monorepo の python スタックはここで paths 絞り + working-directory で対象化する。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "manji-standard-server-python/**"
+      - ".github/workflows/python-ci.yml"
+  pull_request:
+    paths:
+      - "manji-standard-server-python/**"
+      - ".github/workflows/python-ci.yml"
+
+defaults:
+  run:
+    working-directory: manji-standard-server-python
+
+jobs:
+  # 単体テスト(実DB不要・毎回)
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.7.15"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --locked
+      - run: uv run pytest tests -q -m "not integration"
+      - if: always()
+        run: uv cache prune --ci
+
+  # 実 Postgres 結合テスト(service container)
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mss
+          POSTGRES_PASSWORD: mss
+          POSTGRES_DB: mss
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgresql+psycopg://mss:mss@localhost:5432/mss
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.7.15"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --locked
+      - run: uv run pytest tests -q -m integration
+      - if: always()
+        run: uv cache prune --ci
+
+  # codegen 再現性ゲート(manji流): 生成器を再実行して差分ゼロを強制
+  codegen-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install protoc
+        working-directory: .
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.7.15"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --locked
+      - name: regenerate
+        run: |
+          uv run python tools/mss-protoc-gen/main.py
+          uv run python tools/mss-migration-gen/main.py
+      - name: assert generated code is committed & reproducible
+        working-directory: .
+        run: |
+          if [ -n "$(git status --porcelain -- manji-standard-server-python)" ]; then
+            echo "::error::generated code drifted — regenerate & commit"
+            git status --porcelain -- manji-standard-server-python
+            git --no-pager diff -- manji-standard-server-python
+            exit 1
+          fi
