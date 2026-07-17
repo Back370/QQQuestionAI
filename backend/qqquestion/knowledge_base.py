@@ -71,11 +71,12 @@ class TavilySearch:
 
 
 class DuckDuckGoSearch:
-    # ddgs はメタ検索ライブラリで、backend の既定値 "auto" は text カテゴリの全エンジン
-    # （brave / google / startpage / yandex / yahoo / mojeek / wikipedia 等）に問い合わせる。
-    # 送信先は README の「外部に送信されるデータ」で申告している以上、既定に任せると
-    # 申告が実態と食い違う（利用者は DuckDuckGo だけのつもりで9社に送ることになる）。
-    # 送信先を1つに固定するため backend を明示する。
+    # ddgs はメタ検索ライブラリで、backend の既定値 "auto" は text カテゴリのエンジンを
+    # ["wikipedia", "grokipedia"] + shuffle(残り) の順に、必要件数が集まるまで少数ずつ
+    # 呼ぶ。この既定に任せると送信先が実行のたびに変わり（brave のときも yandex の
+    # ときもある）、README の「外部に送信されるデータ」に確定した送信先を書けない。
+    # さらに先頭が wikipedia/grokipedia なので、このクラス名に反して DuckDuckGo には
+    # ほぼ到達しない。送信先を名前どおり1つに保つため backend を明示する。
     BACKEND = "duckduckgo"
 
     def search(self, query: str, max_results: int = 4) -> list[Chunk]:

@@ -54,11 +54,13 @@ def test_tavily_key_takes_precedence(monkeypatch):
 
 
 def test_duckduckgo_search_pins_backend_to_one_engine():
-    """ddgs の既定 backend="auto" は text カテゴリの全エンジンに問い合わせる。
+    """ddgs の既定 backend="auto" は送信先が実行のたびに変わる。
 
-    既定のままだと、README で「DuckDuckGo」と申告しながら実際には google /
-    yandex / brave 等9社にトピック名を送ることになる（申告と実態の食い違い）。
-    送信先を1つに保つため backend の明示を固定する。
+    auto は ["wikipedia", "grokipedia"] + shuffle(残り) の順に必要件数が集まるまで
+    エンジンを呼ぶため、送信先が実行ごとに変動し（brave のときも yandex のときも
+    ある）、README の「外部に送信されるデータ」に確定した送信先を書けない。加えて
+    先頭が wikipedia/grokipedia なので、クラス名に反し DuckDuckGo にほぼ到達しない。
+    送信先を名前どおり1つに保つため backend の明示を固定する。
     """
     assert DuckDuckGoSearch.BACKEND == "duckduckgo"
 
