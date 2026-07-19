@@ -9,6 +9,15 @@ def test_system_prompt_forbids_verdict_in_reason():
     assert "判定宣言" in _SYSTEM
 
 
+def test_system_prompt_hides_missing_point_content_in_reason():
+    # partial の reason が欠けた要点＝答えをそのまま／言い換えで読み上げない
+    # ための指示。これが消えると「〜には言及がない」と正解を列挙する漏洩が
+    # 復活する（judge の reason は UI にそのまま出るため）。
+    assert "欠けている要点" in _SYSTEM
+    assert "言い換えて述べることも" in _SYSTEM  # 言い換えでの漏洩も禁止
+    assert "抽象的に" in _SYSTEM  # 方向だけ示す
+
+
 def test_exact_match_skips_llm(fake_llm, demo_questions):
     question = demo_questions[0]
     judgement = judge_answer(fake_llm, question, question.model_answer)
