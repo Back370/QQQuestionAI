@@ -24,6 +24,7 @@ from .knowledge_base import (
 from .learner_model import HistoryStore, load_learner_state
 from .llm import LLMUnavailableError, create_llm
 from .session import QuizSession
+from .terminput import enable_line_editing
 
 BANNER = """\
 ==========================================================
@@ -34,6 +35,7 @@ BANNER = """\
 
 
 def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int:
+    enable_line_editing()  # input() を日本語（マルチバイト）でも1文字ずつ削除できるようにする
     if demo:
         import os
 
