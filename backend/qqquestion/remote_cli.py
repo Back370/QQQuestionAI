@@ -20,6 +20,8 @@ import sys
 import time
 from typing import Iterator
 
+from .terminput import enable_line_editing
+
 DEFAULT_PORT = 8756
 # 通常のエンドポイント（メモリ参照のみ）
 TIMEOUT = 10.0
@@ -166,6 +168,7 @@ def _wait_for_question(client, port: int, sid: str) -> dict | None:
 
 
 def run(repo: str, port: int) -> int:
+    enable_line_editing()  # input() を日本語（マルチバイト）でも1文字ずつ削除できるようにする
     try:
         import httpx
     except ModuleNotFoundError:
