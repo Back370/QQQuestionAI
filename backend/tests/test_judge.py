@@ -1,5 +1,12 @@
-from qqquestion.judge import judge_answer
+from qqquestion.judge import _SYSTEM, judge_answer
 from qqquestion.models import Judgement
+
+
+def test_system_prompt_forbids_verdict_in_reason():
+    # reason に結論を書かせない指示が消えると correct→partial のような
+    # 自己矛盾した理由がストリーム表示に漏れる（回帰ガード）
+    assert "reason には結論" in _SYSTEM
+    assert "判定宣言" in _SYSTEM
 
 
 def test_exact_match_skips_llm(fake_llm, demo_questions):

@@ -134,7 +134,7 @@ def _build_user(
         )
     difficulty_note = ""
     if difficulty_bias:
-        difficulty_note = "\nトピック別の推奨難易度: " + ", ".join(
+        difficulty_note = "\nトピック別の推奨難易度（1=易しめ〜3=難しめ）: " + ", ".join(
             f"{topic}={level}" for topic, level in difficulty_bias.items()
         )
     return (

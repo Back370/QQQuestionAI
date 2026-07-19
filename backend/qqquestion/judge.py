@@ -22,7 +22,10 @@ model_answer / accepted_points / rubric だけを根拠にすること。
 - verdict: 採点基準の要点をすべて満たせば "correct"、一部なら "partial"、
   ほぼ満たさなければ "incorrect"
 - matched_points / missing_points: accepted_points のうち満たした/欠けた要点
-- reason: どの要点がどう満たされた/欠けたか、採点基準を参照して必ず書く
+- reason: どの要点がどう満たされた/欠けたか、採点基準を参照して必ず書く。
+  reason には結論（"correct" / "partial" / "incorrect" の語や「正解と判定します」
+  のような判定宣言）を書かないこと。verdict は verdict フィールドだけで表し、
+  reason には要点ごとの充足/不足の事実だけを淡々と記す。
 
 表記ゆれ・言い回しの違いは意味が同じなら正解として扱う。
 """

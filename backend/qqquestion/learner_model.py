@@ -2,8 +2,8 @@
 
 - 全対話ログを data/history.jsonl に追記（JSON Lines）
 - トピック別正答率を集計し、ルールベースで出題・ヒントに反映する:
-  - 正答率 50% 未満のトピック = 苦手 → 次回優先出題
-  - 正答率 70% 超のトピック → difficulty +1
+  - 正答率 50% 未満のトピック = 苦手 → 次回優先出題 + 難易度を下げる（推奨1）
+  - 正答率 70% 超のトピック → 難易度を上げる（推奨2）
   - ヒント開始レベル: 苦手トピックは Lv2、それ以外は Lv1
 """
 
@@ -76,12 +76,19 @@ class LearnerState:
         return 1
 
     def difficulty_bias(self) -> dict[str, int]:
-        """正答率 70% 超のトピックは difficulty +1 を推奨。"""
-        return {
-            topic: 2
-            for topic, score in self.topic_scores.items()
-            if score > DIFFICULTY_UP_THRESHOLD
-        }
+        """トピック別に推奨難易度を返す（1〜3）。
+
+        正答率が高いトピックは難易度を上げ（2）、苦手トピック（正答率が
+        WEAK_THRESHOLD 未満）は難易度を下げる（1）。中間のトピックは
+        既定に委ねるためエントリを出さない（プロンプトを膨らませない）。
+        """
+        bias: dict[str, int] = {}
+        for topic, score in self.topic_scores.items():
+            if score > DIFFICULTY_UP_THRESHOLD:
+                bias[topic] = 2  # 正答率が高い → 難易度を上げる
+            elif score < WEAK_THRESHOLD:
+                bias[topic] = 1  # 苦手 → 難易度を下げる
+        return bias
 
 
 def load_learner_state(history_path: str | Path) -> LearnerState:
