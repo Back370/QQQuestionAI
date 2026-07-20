@@ -59,7 +59,19 @@ def test_difficulty_bias():
     state = LearnerState.from_history(
         [_interaction("RNN", "correct")] * 8 + [_interaction("RNN", "incorrect")] * 2
     )
-    assert state.difficulty_bias() == {"RNN": 2}  # 正答率 70% 超で +1
+    assert state.difficulty_bias() == {"RNN": 2}  # 正答率 70% 超で難易度を上げる
+
+
+def test_difficulty_bias_lowers_for_weak_topic():
+    # RNN=100%（上げる）, softmax=25%（苦手→下げる）, 中間トピックは対象外
+    state = LearnerState.from_history(
+        [_interaction("RNN", "correct")] * 4
+        + [_interaction("softmax", "incorrect")] * 3
+        + [_interaction("softmax", "correct")]
+        + [_interaction("中間", "correct")]  # 50%〜70% はエントリを出さない
+        + [_interaction("中間", "incorrect")]
+    )
+    assert state.difficulty_bias() == {"RNN": 2, "softmax": 1}
 
 
 def test_load_learner_state_missing_file(tmp_path):

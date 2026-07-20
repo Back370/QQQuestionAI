@@ -138,9 +138,11 @@ def _public_judgement(judgement, question_done: bool) -> dict:
     matched_points / missing_points は accepted_points（＝正解の骨子）を
     そのまま含むため、問題完了前は空にする。incorrect の reason も欠けた
     要点＝答えの手がかりを含みうるので伏せる（ストリーミング経路が途中
-    経過を流さないのと同じ方針）。partial の reason は「あと何が足りないか」
-    の学習フィードバックとして残す。問題完了後は模範解答が開示されるため
-    そのまま返す。
+    経過を流さないのと同じ方針）。partial の reason は残すが、judge 側の
+    指示で「欠けた要点の内容は言い換えでも読み上げない（満たした要点の
+    確認と、残る観点の方向だけを示す）」よう抽象化しているため、答えを
+    列挙しない学習フィードバックになる。問題完了後は模範解答が開示される
+    ためそのまま返す。
     """
     data = judgement.model_dump()
     if question_done:
