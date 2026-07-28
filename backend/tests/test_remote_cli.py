@@ -112,6 +112,44 @@ def test_print_verdict_giveup_reveals_answer(capsys) -> None:
     assert "正解は「答え」でした" in capsys.readouterr().out
 
 
+def test_print_models_marks_current(capsys) -> None:
+    """--list-models は現在のモデルに * を付けて一覧を出す（issue #20）。"""
+
+    class _Client:
+        def get(self, url, timeout=None):
+            assert url.endswith("/models")
+            return _FakeResponse(
+                200,
+                {
+                    "current": "gemini-2.5-flash",
+                    "source": "api",
+                    "models": [
+                        {"name": "gemini-3.5-flash", "label": "3.5", "description": "新しい"},
+                        {"name": "gemini-2.5-flash", "label": "2.5", "description": "現行"},
+                    ],
+                },
+            )
+
+    remote_cli.print_models(_Client(), 8756)
+    out = capsys.readouterr().out
+    assert "   gemini-3.5-flash  新しい" in out
+    assert " * gemini-2.5-flash  現行" in out
+
+
+def test_select_model_delegates_to_backend() -> None:
+    """モデル切り替えもバックエンド任せ（ターミナルにキーを置かないため）。"""
+    sent: dict = {}
+
+    class _Client:
+        def post(self, url, json=None, timeout=None):
+            sent.update({"url": url, "json": json})
+            return _FakeResponse(200, {"current": json["model"]})
+
+    assert remote_cli.select_model(_Client(), 8756, "gemini-3.5-flash") == "gemini-3.5-flash"
+    assert sent["url"].endswith("/models/select")
+    assert sent["json"] == {"model": "gemini-3.5-flash"}
+
+
 def test_module_holds_no_api_key_handling() -> None:
     """このクライアントは API キーを扱わない（バックエンドに委譲する）。"""
     source = (remote_cli.__file__ and open(remote_cli.__file__, encoding="utf-8").read()) or ""

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Iterator, Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -25,11 +26,47 @@ T = TypeVar("T", bound=BaseModel)
 #   ("final", BaseModel)   — 検証済みの最終結果。必ず最後に1回だけ流れる
 StreamEvent = tuple[str, object]
 
-# 既定モデル。Google は退役したモデルを「新規プロジェクトからは 404」にして段階的に
-# 閉じるため、既定値が古いと"新しくAPIキーを取った人だけ"が壊れる（既存キーでは再現
-# しない）。過去 2.0→2.5→3.5 と踏んでいるので、404 は _classify_llm_error が
-# QQQ_MODEL での回避を案内できるようにしてある。
+# 既定モデル。**どの名前なら安全か、はコード側では決められない**——退役したモデルは
+# 「新規プロジェクトからは 404」になり、逆に新しすぎるモデルもロールアウトやティアの
+# 都合で 404 になる。どちらも API キー側の事情なので、開発者の手元で正しくても
+# 別の利用者では 404、という壊れ方をする（過去 2.0→2.5→3.5 と踏んだ）。
+# そのため既定値を固定で守ろうとせず、
+#   - 使えるモデルの提示は available_models()（API の ListModels）に任せる
+#   - 404 は _classify_llm_error が「モデルを切り替える」導線を案内する
+# という回復可能性の側で担保する。
 DEFAULT_MODEL = "gemini-2.5-flash"
+
+# 選択候補のフォールバック。**正となる一覧は API から取る**（available_models）。
+# ここに固定リストを持つのは、APIキー未設定・オフライン・API 仕様変更で一覧を
+# 取れないときでも UI に選択肢を出すための保険で、放っておけば必ず古くなる。
+FALLBACK_MODELS: tuple[tuple[str, str], ...] = (
+    ("gemini-3.5-flash", "高速・低コスト。日常のクイズ生成向け"),
+    ("gemini-3-pro-preview", "高品質・低速。難しい差分の出題や判定向け"),
+    ("gemini-2.5-flash", "1世代前の高速モデル"),
+    ("gemini-2.5-pro", "1世代前の高品質モデル"),
+    ("gemini-2.5-flash-lite", "最軽量・最安。品質より速度"),
+    # 世代を追いかけないエイリアス。名前が退役しないので、固定リストが
+    # 古くなっても「とりあえず動くもの」を選べる逃げ道として載せる
+    ("gemini-flash-latest", "その時点の最新 Flash（名前が退役しない）"),
+    ("gemini-pro-latest", "その時点の最新 Pro（名前が退役しない）"),
+)
+
+# モデル一覧 API（ListModels）。キーはクエリに載るので **URL をログに出さない**。
+MODEL_LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+MODEL_LIST_TIMEOUT = 10.0
+# 一覧はほぼ変わらないので、切り替え UI を開くたびに API を叩かないようキャッシュする
+MODEL_LIST_TTL = 300.0
+
+# structured output（JSON）に使えないモデルを一覧から落とすための語。
+# generateContent 対応だけでは埋め込み以外の特殊モデル（TTS・画像生成等）が
+# 残り、選ぶと必ず失敗する選択肢を UI に並べてしまう。
+_EXCLUDED_MODEL_WORDS = (
+    "embedding", "aqa", "tts", "image", "audio", "live", "vision",
+    "robotics", "computer-use",
+)
+
+# (取得時刻, 使ったAPIキー, 一覧)。キーを変えたら取り直す
+_model_cache: tuple[float, str, list[dict[str, str]]] | None = None
 
 # 1回のLLM呼び出しの応答待ち上限（秒）。これを超えると打ち切って例外にする。
 # タイムアウトが無いと、API無応答・レート制限のリトライ待ちで prepare_first() が
@@ -61,8 +98,121 @@ def _llm_timeout() -> float:
         return DEFAULT_TIMEOUT
 
 
-def _current_model_name() -> str:
-    return os.environ.get("QQQ_MODEL", DEFAULT_MODEL)
+def current_model_name() -> str:
+    """いま使うモデル名。QQQ_MODEL が空文字のときも既定に落とす。"""
+    return os.environ.get("QQQ_MODEL") or DEFAULT_MODEL
+
+
+def set_current_model(name: str | None) -> str:
+    """使うモデルを切り替えて、切り替え後の名前を返す（空/None で既定に戻す）。
+
+    プロセス全体（QQQ_MODEL）に効く。GeminiLLM は呼び出しのたびにこの値を読むので、
+    サーバを再起動しなくても次の生成から新しいモデルになる。永続化はしない
+    ——「次回の起動でも同じモデル」は、拡張なら設定 qqquestion.model、
+    ターミナルなら backend/.env の QQQ_MODEL が担当する。
+    """
+    cleaned = (name or "").strip()
+    if cleaned:
+        os.environ["QQQ_MODEL"] = cleaned
+    else:
+        os.environ.pop("QQQ_MODEL", None)
+    return current_model_name()
+
+
+def _usable_model(name: str, methods: list[str]) -> bool:
+    if "generateContent" not in methods:
+        return False
+    if not name.startswith("gemini-"):
+        return False  # gemma 等、structured output の実績が無いものは出さない
+    return not any(word in name for word in _EXCLUDED_MODEL_WORDS)
+
+
+def _model_sort_key(name: str) -> tuple[int, int, str]:
+    """新しい世代を上に。gemini-3.5 > gemini-3 > gemini-2.5 の順に並べる。"""
+    match = re.match(r"gemini-(\d+)(?:\.(\d+))?", name)
+    if not match:
+        return (0, 0, name)
+    return (-int(match.group(1)), -int(match.group(2) or 0), name)
+
+
+def _fetch_models(api_key: str) -> list[dict[str, str]]:
+    """Gemini の ListModels を叩いて、使えるモデルの一覧を作る。"""
+    import urllib.parse
+    import urllib.request
+
+    # pageSize は上限まで取る。ページングは実質不要（数十件）なので追わない
+    url = f"{MODEL_LIST_URL}?pageSize=1000&key={urllib.parse.quote(api_key)}"
+    with urllib.request.urlopen(url, timeout=MODEL_LIST_TIMEOUT) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    entries: list[dict[str, str]] = []
+    for item in payload.get("models", []):
+        name = str(item.get("name", "")).removeprefix("models/")
+        methods = [str(m) for m in item.get("supportedGenerationMethods", [])]
+        if not _usable_model(name, methods):
+            continue
+        description = str(item.get("description", "")).strip()
+        entries.append(
+            {
+                "name": name,
+                "label": str(item.get("displayName") or name),
+                # API の説明文は長いものがあるので、選択 UI に収まる長さに切る
+                "description": description[:120],
+            }
+        )
+    entries.sort(key=lambda entry: _model_sort_key(entry["name"]))
+    return entries
+
+
+def fallback_models() -> list[dict[str, str]]:
+    """API を叩けないときに出す選択肢（現在のモデルと既定は必ず含める）。"""
+    entries = [
+        {"name": name, "label": name, "description": description}
+        for name, description in FALLBACK_MODELS
+    ]
+    known = {entry["name"] for entry in entries}
+    for name in (current_model_name(), DEFAULT_MODEL):
+        if name not in known:
+            entries.append({"name": name, "label": name, "description": ""})
+            known.add(name)
+    entries.sort(key=lambda entry: _model_sort_key(entry["name"]))
+    return entries
+
+
+def available_models(refresh: bool = False) -> tuple[list[dict[str, str]], str]:
+    """選べるモデルの一覧と、その出所 ("api" | "fallback") を返す。
+
+    固定リストは必ず陳腐化する（このリポジトリも 2.0→2.5→3.5 と踏んでいる）ので、
+    APIキーがあるときは Google の ListModels を正とする。失敗しても切り替え UI が
+    空にならないよう、フォールバックの候補を返す。
+    """
+    global _model_cache
+
+    api_key = os.environ.get("GOOGLE_API_KEY", "")
+    if not api_key:
+        return fallback_models(), "fallback"
+    cached = _model_cache
+    if (
+        not refresh
+        and cached is not None
+        and cached[1] == api_key
+        and time.monotonic() - cached[0] < MODEL_LIST_TTL
+    ):
+        return list(cached[2]), "api"
+    try:
+        entries = _fetch_models(api_key)
+    except Exception as error:
+        # URL に API キーが載るので、ログに出す前に必ず伏せる（AGENTS.md 安全ルール2）
+        logger.warning(
+            "モデル一覧の取得に失敗しました: %s: %s",
+            type(error).__name__,
+            str(error).replace(api_key, "***"),
+        )
+        return fallback_models(), "fallback"
+    if not entries:
+        logger.warning("モデル一覧が空でした（API の応答形式が変わった可能性）")
+        return fallback_models(), "fallback"
+    _model_cache = (time.monotonic(), api_key, entries)
+    return list(entries), "api"
 
 
 def _is_model_missing_error(error: Exception) -> bool:
@@ -127,9 +277,10 @@ def _classify_llm_error(error: Exception) -> str:
         return "APIキーが無効か権限がありません。GOOGLE_API_KEY を確認してください。"
     if _is_model_missing_error(error):
         return (
-            f"AIモデル「{_current_model_name()}」が使えません（提供終了か名前の誤り）。"
-            "環境変数 QQQ_MODEL に現行のモデル名を設定して再試行してください。"
-            "使えるモデルは https://ai.google.dev/gemini-api/docs/models で確認できます。"
+            f"AIモデル「{current_model_name()}」が使えません（提供終了か名前の誤り）。"
+            "コマンドパレットの「QQQuestionAI: 使用するモデルを選択」"
+            "（ターミナルでは quiz --model <モデル名>、環境変数なら QQQ_MODEL）"
+            "で、いま使えるモデルに切り替えて再試行してください。"
         )
     return f"AIサービスの呼び出しに失敗しました: {error}"
 
@@ -146,11 +297,18 @@ class GeminiLLM:
     """LangChain 経由の Gemini 実装（architecture.md §2）。"""
 
     def __init__(self, model: str | None = None):
-        self._model_name = model or _current_model_name()
+        # 明示指定が無ければ**呼び出しのたびに** QQQ_MODEL を読む（_model_name）。
+        # 起動時に固定してしまうと、実行中のバックエンドでモデルを切り替えても
+        # 反映されず、切り替えのたびにプロセス再起動が要る（issue #20）。
+        self._explicit_model = model
         # APIキーの検査は呼び出し時に遅延させる。起動時に例外を投げると
         # サーバが立ち上がらず、ユーザーに何も表示できないまま静かにスキップに
         # なるため。呼び出し時に LLMUnavailableError を投げれば、fail-open 経路が
         # UI に「APIキー未設定」を出せる。
+
+    @property
+    def _model_name(self) -> str:
+        return self._explicit_model or current_model_name()
 
     def _require_key(self) -> None:
         if not os.environ.get("GOOGLE_API_KEY"):

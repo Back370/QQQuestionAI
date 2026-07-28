@@ -138,6 +138,20 @@ direction.md を対象とした実装アーキテクチャを定義する。
 - 共通入力: `diff_context`（該当コード断片）、`topic`、`retrieved_chunks`（知識ベースからの引用候補）
 - API キーは環境変数 `GOOGLE_API_KEY` から読む。コード・ログに書かない
 
+#### モデルの切り替え
+
+使うモデルは `QQQ_MODEL`（未設定なら `llm.DEFAULT_MODEL`）だが、**利用者に環境変数を設定させない**:
+
+| 入口 | 操作 | 保存先（次回起動時） |
+|---|---|---|
+| VSCode 拡張 | ステータスバーのモデル名 / コマンド「使用するモデルを選択」 | 設定 `qqquestion.model` → 起動時に `QQQ_MODEL` として渡す |
+| ターミナル（拡張利用者） | `quiz --list-models` / `quiz --model <名前>` | 保存しない（バックエンドのプロセスにのみ効く） |
+| ターミナル（`cli.py`） | `--model` | `backend/.env` の `QQQ_MODEL` |
+
+- **一覧は Google の ListModels（`GET /v1beta/models`）から取る。** 固定リストは必ず陳腐化し（このリポジトリも 2.0→2.5→3.5 と踏んだ）、退役モデルは*新規プロジェクトにだけ* 404 になるため、開発者の手元では再現しない壊れ方をする。キー未設定・オフライン時だけ `llm.FALLBACK_MODELS` に落ちる。一覧取得はキーをクエリに載せるので、失敗ログでもキーを伏せる（AGENTS.md 安全ルール2）
+- **切り替えはプロセス再起動を伴わない。** `GeminiLLM` は生成のたびに現在のモデル名を読む（`POST /models/select` → `QQQ_MODEL` を書き換え）ので、進行中セッションの次の生成から新しいモデルになる
+- 拡張側の設定 `qqquestion.model` は「次回も同じモデル」を担保するためだけにあり、即時反映は HTTP 経由。設定を直接編集した場合も `onDidChangeConfiguration` から同じ経路で反映する
+
 ### 5.2 役割別 IO
 
 #### (a) 出題生成 `generate_question(diff, topics, learner_state) -> list[Question]`

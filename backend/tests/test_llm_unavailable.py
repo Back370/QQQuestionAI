@@ -13,7 +13,6 @@ from fastapi.testclient import TestClient
 from qqquestion.diff_analyzer import analyze
 from qqquestion.knowledge_base import InMemoryKnowledgeBase
 from qqquestion.llm import (
-    DEFAULT_MODEL,
     DEFAULT_TIMEOUT,
     GeminiLLM,
     LLMUnavailableError,
@@ -84,6 +83,14 @@ def test_retired_model_404_does_not_double_wait():
     assert _is_unavailable_error(error)
 
 
+# 「既定モデルが退役名でないこと」を denylist で固定するテストは廃止した。
+# どのモデルが 404 になるかは API キー側の事情（退役だけでなく、新しすぎて
+# 未提供でもなる）で決まり、テストからは判定できない。1つのキーでの観測を
+# 全員の事実として固定してしまい、正当な既定値の変更を赤にするだけだった。
+# 代わりに、使えるモデルの提示は available_models() が API から行い、404 は
+# 上のテストのとおり切り替え導線を案内する（tests/test_model_switch.py 参照）。
+
+
 # ---- 速度優先の thinking パラメータはモデル世代で変わる ---------------
 
 
@@ -109,11 +116,6 @@ def test_fast_thinking_kwargs_matches_installed_library():
     for model in ("gemini-3.5-flash", "gemini-2.5-flash"):
         for name in _fast_thinking_kwargs(model):
             assert name in fields, f"{name} が langchain-google-genai に無い"
-
-
-def test_default_model_is_not_a_retired_one():
-    """既定モデルは新規プロジェクトで 404 になったものに戻さない。"""
-    assert DEFAULT_MODEL not in {"gemini-2.0-flash", "gemini-2.5-flash"}
 
 
 # ---- タイムアウト設定 -------------------------------------------------
