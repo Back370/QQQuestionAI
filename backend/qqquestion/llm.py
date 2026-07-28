@@ -29,7 +29,7 @@ StreamEvent = tuple[str, object]
 # 閉じるため、既定値が古いと"新しくAPIキーを取った人だけ"が壊れる（既存キーでは再現
 # しない）。過去 2.0→2.5→3.5 と踏んでいるので、404 は _classify_llm_error が
 # QQQ_MODEL での回避を案内できるようにしてある。
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 # 1回のLLM呼び出しの応答待ち上限（秒）。これを超えると打ち切って例外にする。
 # タイムアウトが無いと、API無応答・レート制限のリトライ待ちで prepare_first() が

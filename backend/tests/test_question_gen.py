@@ -61,6 +61,70 @@ def test_weak_topics_and_difficulty_in_prompt(fake_llm, diff_ctx):
     assert "苦手トピック" in prompt and "勾配計算" in prompt
     assert "RNN=2" in prompt
     assert "```diff" in prompt
+    # 推奨難易度は system 側の難易度定義と同じ尺度を指すことを明示している
+    assert "difficulty の定義" in prompt
+
+
+def _enqueue_five(fake_llm) -> None:
+    fake_llm.enqueue(
+        QuestionSet(
+            questions=[
+                _make_question("a", "prerequisite"),
+                _make_question("b", "prerequisite"),
+                _make_question("c", "implementation"),
+                _make_question("d", "implementation"),
+                _make_question("e", "implementation"),
+            ]
+        )
+    )
+
+
+def _assert_difficulty_guide(system: str) -> None:
+    """1/2/3 が何を問うレベルかを system プロンプトが定義していること。
+
+    数値だけ渡すと LLM が中央値（2）に寄り、難易度2ばかりが出題される。
+    """
+    assert "1: 用語や API の意味" in system
+    assert "2: そのコードで何が起きるか" in system
+    assert "3: なぜその書き方を選んだか" in system
+
+
+def test_difficulty_guide_in_batch_prompt(fake_llm, diff_ctx):
+    _enqueue_five(fake_llm)
+    generate_questions(fake_llm, diff_ctx)
+    system = fake_llm.calls[0]["system"]
+    _assert_difficulty_guide(system)
+    assert "難易度1と難易度3をそれぞれ1問以上含める" in system
+
+
+def test_difficulty_guide_in_first_question_prompt(fake_llm, diff_ctx):
+    from qqquestion.question_gen import generate_first_question
+
+    fake_llm.enqueue(_make_question("a", "prerequisite"))
+    generate_first_question(fake_llm, diff_ctx)
+    system = fake_llm.calls[0]["system"]
+    _assert_difficulty_guide(system)
+    assert "第1問は導入なので difficulty は 1 か 2 とする" in system
+
+
+def test_difficulty_guide_in_remaining_questions_prompt(fake_llm, diff_ctx):
+    from qqquestion.question_gen import generate_remaining_questions_stream
+
+    first = _make_question("q1", "prerequisite").model_copy(update={"difficulty": 3})
+    fake_llm.enqueue(
+        QuestionSet(
+            questions=[
+                _make_question("b", "prerequisite"),
+                _make_question("c", "implementation"),
+                _make_question("d", "implementation"),
+                _make_question("e", "implementation"),
+            ]
+        )
+    )
+    list(generate_remaining_questions_stream(fake_llm, diff_ctx, first))
+    _assert_difficulty_guide(fake_llm.calls[0]["system"])
+    # 第1問の難易度を伝え、残り4問の配分をそれに合わせられるようにする
+    assert "難易度3" in fake_llm.calls[0]["user"]
 
 
 def test_demo_llm_returns_five_rnn_questions(demo_llm, diff_ctx):

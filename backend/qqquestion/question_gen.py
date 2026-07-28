@@ -21,6 +21,20 @@ PERSONA = (
     "学習者が自分で書いたコードを本当に理解しているかを確かめます。"
 )
 
+# 難易度の定義。`1〜3` とだけ渡すと LLM は基準の無いスケールの中央値（2）に
+# 寄るため、各レベルがどんな問いなのかを明文化する。learner_model の
+# difficulty_bias() が返す推奨難易度もこの定義を指す（_build_user から同じ語彙で参照）。
+_DIFFICULTY_GUIDE = """- difficulty: 問いの深さ。次の定義に厳密に従って 1〜3 を付ける
+  - 1: 用語や API の意味・役割を答えられれば済む問い（知っているか）
+  - 2: そのコードで何が起きるか、挙動やデータの流れを説明する問い（何が起きるか）
+  - 3: なぜその書き方を選んだか、選ばなかった場合に何が起きるかまで説明する問い（なぜそう書くか）"""
+
+# 難易度の配分。定義だけ与えても全問が同じレベルに揃いやすいので、散らすことを明示する。
+# 推奨難易度（difficulty_bias）は学習者の実績に基づくため、配分より優先させる。
+_DIFFICULTY_SPREAD = """難易度の配分の厳守:
+- 全問を同じ難易度で揃えない。難易度1と難易度3をそれぞれ1問以上含める
+- トピック別の推奨難易度が指定されている場合は、そのトピックの問題に限り推奨を優先する"""
+
 _SYSTEM = PERSONA + """
 与えられたコミット差分から、記述式の理解度確認問題をちょうど5問生成してください。
 
@@ -34,7 +48,9 @@ _SYSTEM = PERSONA + """
 - accepted_points: 正解と認めるために解答に含まれるべき要点のリスト（2〜4個）
 - rubric: 採点基準（どの要点が揃えば correct / 一部なら partial かを明文化）
 - topic: 問題のトピック名（与えられたトピック候補から選ぶか近いものを付ける）
-- difficulty: 1〜3
+""" + _DIFFICULTY_GUIDE + """
+
+""" + _DIFFICULTY_SPREAD + """
 
 出題形式の厳守（記述式の一問一答）:
 - 1問につき問いは1つだけ。「それぞれ説明してください」「〜ですか？また、〜ですか？」のように
@@ -134,8 +150,11 @@ def _build_user(
         )
     difficulty_note = ""
     if difficulty_bias:
-        difficulty_note = "\nトピック別の推奨難易度（1=易しめ〜3=難しめ）: " + ", ".join(
-            f"{topic}={level}" for topic, level in difficulty_bias.items()
+        # 数値の意味は system 側の _DIFFICULTY_GUIDE と共有する（同じ尺度を指すことを明示）
+        difficulty_note = (
+            "\nこの学習者のトピック別の推奨難易度（数値の意味は difficulty の定義のとおり。"
+            "該当トピックの問題はこの難易度で出すこと）: "
+            + ", ".join(f"{topic}={level}" for topic, level in difficulty_bias.items())
         )
     return (
         f"トピック候補: {', '.join(diff_ctx.topics) or '(差分から推定)'}"
@@ -198,7 +217,10 @@ _FIRST_SYSTEM = PERSONA + """
 - accepted_points: 正解と認めるために解答に含まれるべき要点のリスト（2〜4個）
 - rubric: 採点基準（どの要点が揃えば correct / 一部なら partial かを明文化）
 - topic: 問題のトピック名（与えられたトピック候補から選ぶか近いものを付ける）
-- difficulty: 1〜3
+""" + _DIFFICULTY_GUIDE + """
+
+第1問は導入なので difficulty は 1 か 2 とする（3 にしない）。
+ただしトピック別の推奨難易度が指定されている場合は、そちらを優先する。
 
 出題形式の厳守（記述式の一問一答）:
 - 問いは1つだけ。複数の論点を束ねず、疑問文は1つまで
@@ -221,7 +243,10 @@ _REST_SYSTEM = PERSONA + """
 - accepted_points: 正解と認めるために解答に含まれるべき要点のリスト（2〜4個）
 - rubric: 採点基準（どの要点が揃えば correct / 一部なら partial かを明文化）
 - topic: 問題のトピック名（与えられたトピック候補から選ぶか近いものを付ける）
-- difficulty: 1〜3
+""" + _DIFFICULTY_GUIDE + """
+
+""" + _DIFFICULTY_SPREAD + """
+- 第1問（出題済み）の難易度は下に示す。第2〜5問の中で難易度1と難易度3を1問以上ずつ満たす
 
 出題形式の厳守（記述式の一問一答）:
 - 1問につき問いは1つだけ。複数の論点を束ねず、疑問文は各問1つまで
@@ -260,7 +285,8 @@ def generate_remaining_questions_stream(
     """
     user = (
         _build_user(diff_ctx, weak_topics, difficulty_bias)
-        + f"\n\n出題済みの第1問（重複しないこと）:\n{first_question.text}"
+        + f"\n\n出題済みの第1問（重複しないこと。難易度{first_question.difficulty}）:"
+        f"\n{first_question.text}"
     )
     yield from _stream_question_set(llm, _REST_SYSTEM, user, start_slot=1)
 
