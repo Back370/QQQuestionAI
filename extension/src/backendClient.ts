@@ -36,6 +36,22 @@ export interface AnswerResponse {
   status: string;
 }
 
+export interface ModelChoice {
+  name: string;
+  label: string;
+  description: string;
+}
+
+export interface ModelList {
+  current: string;
+  default: string;
+  // "api": Google の一覧から取得（実際に使えるモデル）
+  // "fallback": キー未設定・オフライン等で取得できず、内蔵の候補を返した
+  source: "api" | "fallback";
+  fake_llm: boolean;
+  models: ModelChoice[];
+}
+
 // /answer/stream, /giveup/stream (SSE) の1イベント。
 // event: "judgement_partial" | "judgement" | "explanation_partial" | "result"
 export interface StreamEvent {
@@ -105,6 +121,32 @@ export class BackendClient {
     } catch {
       return false;
     }
+  }
+
+  // /health の中身。使用中のモデル名を知るのに使う（モデル一覧 API と違い
+  // 外部への問い合わせが無いので、ステータスバーの更新に何度呼んでも安い）。
+  async info(): Promise<{ status: string; model?: string } | undefined> {
+    try {
+      const response = await this.fetchWithTimeout("/health", undefined, 2000);
+      return response.ok ? ((await response.json()) as { status: string; model?: string }) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // 選べるモデルの一覧。Google の ListModels を叩くことがあるため長めに待つ。
+  models(refresh = false): Promise<ModelList> {
+    return this.request(`/models${refresh ? "?refresh=true" : ""}`, undefined, LLM_TIMEOUT_MS);
+  }
+
+  // 使用モデルを切り替える（バックエンドは再起動不要。次の生成から効く）。
+  // 空文字を渡すと既定モデルに戻る。
+  selectModel(model: string): Promise<{ current: string; default: string; previous: string }> {
+    return this.request("/models/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    });
   }
 
   // クイズを開始する（コミットとは無関係。結果がコミットを左右することはない）。

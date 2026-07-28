@@ -138,6 +138,20 @@ direction.md を対象とした実装アーキテクチャを定義する。
 - 共通入力: `diff_context`（該当コード断片）、`topic`、`retrieved_chunks`（知識ベースからの引用候補）
 - API キーは環境変数 `GOOGLE_API_KEY` から読む。コード・ログに書かない
 
+#### モデルの切り替え
+
+使うモデルは `QQQ_MODEL`（未設定なら `llm.DEFAULT_MODEL`）だが、**利用者に環境変数を設定させない**:
+
+| 入口 | 操作 | 保存先（次回起動時） |
+|---|---|---|
+| VSCode 拡張 | ステータスバーのモデル名 / コマンド「使用するモデルを選択」 | 設定 `qqquestion.model` → 起動時に `QQQ_MODEL` として渡す |
+| ターミナル（拡張利用者） | `quiz --list-models` / `quiz --model <名前>` | 保存しない（バックエンドのプロセスにのみ効く） |
+| ターミナル（`cli.py`） | `--model` | `backend/.env` の `QQQ_MODEL` |
+
+- **一覧は Google の ListModels（`GET /v1beta/models`）から取る。** 固定リストは必ず陳腐化し（このリポジトリも 2.0→2.5→3.5 と踏んだ）、退役モデルは*新規プロジェクトにだけ* 404 になるため、開発者の手元では再現しない壊れ方をする。キー未設定・オフライン時だけ `llm.FALLBACK_MODELS` に落ちる。一覧取得はキーをクエリに載せるので、失敗ログでもキーを伏せる（AGENTS.md 安全ルール2）
+- **切り替えはプロセス再起動を伴わない。** `GeminiLLM` は生成のたびに現在のモデル名を読む（`POST /models/select` → `QQQ_MODEL` を書き換え）ので、進行中セッションの次の生成から新しいモデルになる
+- 拡張側の設定 `qqquestion.model` は「次回も同じモデル」を担保するためだけにあり、即時反映は HTTP 経由。設定を直接編集した場合も `onDidChangeConfiguration` から同じ経路で反映する
+
 ### 5.2 役割別 IO
 
 #### (a) 出題生成 `generate_question(diff, topics, learner_state) -> list[Question]`
@@ -198,7 +212,9 @@ class Explanation(BaseModel):
 ```python
 @dataclass
 class LearnerState:
-    topic_scores: dict[str, float]   # トピック別正答率
+    topic_scores: dict[str, float]   # トピック別正答率（直近 RECENT_WINDOW 件で算出）
+    topic_attempts: dict[str, int]   # 直近ウィンドウ内の解答数
+    stumbled_topics: set[str]        # 過去に一度でも不正解だったトピック
     current_hint_level: int          # 1(抽象) 〜 4(ほぼ核心)
     attempt_count: int
     history: list[Interaction]       # 全対話ログ (data/history.jsonl で永続化)
@@ -214,8 +230,12 @@ class LearnerState:
 
 ### 苦手傾向の反映（ルールベース）
 
-- `history.jsonl` からトピック別正答率を集計し、正答率 50% 未満のトピックを「苦手」と判定。次回セッションの出題で優先的に取り上げる
-- 出題難易度も `topic_scores` に応じて選択（正答率 70% 超で difficulty +1）
+- `history.jsonl` からトピック別正答率を集計し、正答率 50% 未満のトピックを「苦手」と判定
+- 正答率は**トピックごとに直近 `RECENT_WINDOW`(=5) 件**だけで見る。全履歴で平均すると一度の不正解が何セッションも残り、あとから正解できるようになっても苦手から抜けられない（＝克服が反映されない）
+- 苦手のうち**今回の差分に関係するもの**だけを優先出題に回す（`priority_topics()`、上限 `MAX_PRIORITY_TOPICS`(=3) 件）。無関係なトピックまで「優先出題」と指示すると、出題が差分から離れるか指示が丸ごと無視される。トピック名の照合は正規化した双方向の部分一致（履歴側の名前は LLM が付けるため差分側の語彙と完全一致しない）
+- 出題難易度も `topic_scores` に応じて選択（正答率 70% 超で difficulty +1、苦手は difficulty を下げる）。`difficulty_bias(diff_topics)` も同様に差分関連のトピックだけに絞る
+- つまずいた履歴があり直近では 70% 超で正解できているトピックは「克服した」として学習者に提示する（`overcome_topics()`、出題には使わない）
+- 「苦手一覧」と「今回優先出題するもの」は UI/ターミナルで別々に見せる。全部が毎回出題されるわけではないため（`format_learner_summary()`）
 - LLM に委ねず集計とルールで決定する（direction.md「あると良い機能」への対応）
 
 ---

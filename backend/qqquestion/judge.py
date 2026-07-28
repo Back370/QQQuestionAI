@@ -5,6 +5,8 @@
   照合として行い、判定理由を必須にする。理由が空なら1回だけ再判定
 - 部分正解の要点は attempt をまたいで持ち越す: 前回までに満たした要点
   （already_matched）は再度の言及を要求せず、残りが埋まれば correct にする
+- 合算は「昇格」専用: LLM が correct と判定したものを partial に落とさない
+  （要点の文字列対応付けに失敗しただけで降格する事故を防ぐ / Issue #17）
 """
 
 from __future__ import annotations
@@ -21,7 +23,10 @@ model_answer / accepted_points / rubric だけを根拠にすること。
 
 - verdict: 採点基準の要点をすべて満たせば "correct"、一部なら "partial"、
   ほぼ満たさなければ "incorrect"
-- matched_points / missing_points: accepted_points のうち満たした/欠けた要点
+- matched_points / missing_points: accepted_points のうち満たした/欠けた要点。
+  **accepted_points の文字列をそのままコピーして返すこと**（要約・言い換え・
+  結合をしない）。システムがこの文字列で要点を突き合わせるため、書き換えると
+  満たした要点が数えられなくなる。
 - reason: 学習者に見せるフィードバック。次を必ず守る。
   (1) 満たせている要点は「〜は捉えられています」と確認してよい（学習者が
       自分で書いた内容なので明かしても漏洩にならない）。
@@ -47,35 +52,85 @@ def _exact_match(question: Question, answer: str) -> bool:
     return any(normalize(candidate) == normalized_answer for candidate in candidates)
 
 
-def _canonical_point(point: str, accepted_points: Sequence[str]) -> str | None:
-    """LLM が返した要点文字列を accepted_points の正規の1つに対応付ける。"""
+# 要点の対応付けで「言い換え」を許すしきい値（文字bigramの重なり率）。
+# 完全一致・包含で決まらないときだけ使う保険なので、取りこぼしを拾える程度に
+# 緩く、別の要点を誤って同一視しない程度に厳しい値にしている。
+_FUZZY_THRESHOLD = 0.6
+_MIN_FUZZY_BIGRAMS = 3  # これより短い文字列は誤対応が多いのでファジー照合しない
+# 「LLM の返した短い断片が長い要点に含まれる」方向の照合に要求する最小長。
+# "200" のような断片で要点1つを満たしたと数えないため（textutil.contains_answer
+# の min_len と同じ考え方）
+_MIN_CONTAINED_LEN = 4
+
+
+def _bigrams(text: str) -> set[str]:
+    return {text[i : i + 2] for i in range(len(text) - 1)}
+
+
+def _overlap(a: str, b: str) -> float:
+    """短い方を基準にした文字bigramの重なり率（0.0〜1.0）。
+
+    「200を返して呼び出し元のリトライを止める」のような長い要点に対して、
+    LLM が「リトライを止める目的」と短く言い換えて返しても対応付けられる
+    ように、長さの差でスコアが落ちない指標を使う。
+    """
+    grams_a, grams_b = _bigrams(a), _bigrams(b)
+    shorter = min(len(grams_a), len(grams_b))
+    if shorter < _MIN_FUZZY_BIGRAMS:
+        return 0.0
+    return len(grams_a & grams_b) / shorter
+
+
+def canonical_point(point: str, accepted_points: Sequence[str]) -> str | None:
+    """LLM が返した要点文字列を accepted_points の正規の1つに対応付ける。
+
+    session がヒントの対象（満たせた要点 / 欠けている要点）を求めるのにも使う。
+    完全一致・包含で決まらないときは、最も重なりが大きい要点に寄せる（対応が
+    取れずに落ちた要点は「まだ欠けている」と誤認され、全要点を満たしても
+    partial のままになるため / Issue #17）。
+    """
     normalized = normalize(point)
     if not normalized:
         return None
+    best_score, best_point = 0.0, None
     for accepted in accepted_points:
         normalized_accepted = normalize(accepted)
-        if (
-            normalized == normalized_accepted
-            or normalized in normalized_accepted
-            or normalized_accepted in normalized
-        ):
+        if not normalized_accepted:
+            continue
+        if normalized == normalized_accepted or normalized_accepted in normalized:
+            return accepted  # 要点がそのまま含まれている
+        if len(normalized) >= _MIN_CONTAINED_LEN and normalized in normalized_accepted:
             return accepted
-    return None
+        score = _overlap(normalized, normalized_accepted)
+        if score >= _FUZZY_THRESHOLD and score > best_score:
+            best_score, best_point = score, accepted
+    return best_point
 
 
 def _merge_with_previous(
     question: Question, judgement: Judgement, already_matched: Sequence[str]
 ) -> Judgement:
-    """前回までに満たした要点と合算し、verdict を決定的に再計算する。"""
+    """前回までに満たした要点と合算し、verdict を決定的に再計算する。
+
+    合算がするのは partial → correct の「昇格」だけで、降格はしない。
+    """
     matched: list[str] = []
     for point in [*already_matched, *judgement.matched_points]:
-        canonical = _canonical_point(point, question.accepted_points)
+        canonical = canonical_point(point, question.accepted_points)
         if canonical is not None and canonical not in matched:
             matched.append(canonical)
     missing = [p for p in question.accepted_points if p not in matched]
 
-    if judgement.verdict == "correct" and not already_matched:
-        return judgement  # 単独で正解ならそのまま（合算で降格はさせない）
+    if judgement.verdict == "correct":
+        # LLM が correct と言ったものは合算で降格させない。要点の文字列対応付け
+        # は言い換えに弱く、対応が取れなかった要点を「欠けている」と誤認して
+        # 「全要点に触れたのに部分正解」になる事故があった（Issue #17）
+        return Judgement(
+            verdict="correct",
+            matched_points=list(question.accepted_points),
+            missing_points=[],
+            reason=judgement.reason,
+        )
     if not missing:
         reason = judgement.reason
         if already_matched:

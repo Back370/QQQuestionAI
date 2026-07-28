@@ -9,7 +9,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
-import { BackendClient } from "./backendClient";
+import { BackendClient, ModelList } from "./backendClient";
 import { QuizPanel } from "./quizPanel";
 
 const POLL_INTERVAL_MS = 1500;
@@ -27,6 +27,8 @@ const API_KEY_SECRET = "qqquestion.googleApiKey";
 let backendProcess: childProcess.ChildProcess | undefined;
 let pollTimer: NodeJS.Timeout | undefined;
 let output: vscode.OutputChannel;
+// 使用中のモデルを出し、クリックで切り替えられるステータスバー項目
+let modelStatus: vscode.StatusBarItem;
 // activate で設定。拡張の設置場所と、書き込み可能な永続ストレージ。
 let extensionPath = "";
 let globalStoragePath = "";
@@ -190,6 +192,11 @@ async function startBackend(client: BackendClient): Promise<void> {
   if (config().get<boolean>("fakeLlm", false)) {
     env.QQQ_FAKE_LLM = "1";
   }
+  // 設定で選んだモデル。空ならバックエンドの既定に任せる（QQQ_MODEL を渡さない）
+  const model = configuredModel();
+  if (model) {
+    env.QQQ_MODEL = model;
+  }
   // 拡張が預かっているキーを優先する（コマンドで明示的に設定されたものなので、
   // 引き継いだ環境変数より意図が新しい）。
   const storedKey = await secrets.get(API_KEY_SECRET);
@@ -299,6 +306,150 @@ function stopBackend(): Promise<void> {
     });
     proc.kill();
   });
+}
+
+// ---- モデルの切り替え -------------------------------------------------
+//
+// 環境変数 QQQ_MODEL を自分で設定しなくても切り替えられるようにする（issue #20）。
+// 選んだモデルは設定 qqquestion.model に保存し（次回起動時も有効）、起動中の
+// バックエンドには POST /models/select で即時反映する（再起動を待たせない）。
+
+function configuredModel(): string {
+  return (config().get<string>("model", "") || "").trim();
+}
+
+// ステータスバーに「いま実際に使われているモデル」を出す。バックエンドが
+// 動いていればそれを正とする（設定が空＝既定のときも実名で表示できる）。
+async function refreshModelStatus(client: BackendClient): Promise<void> {
+  const info = await client.info();
+  const name = info?.model || configuredModel();
+  // バックエンドが未起動で設定も空のときは実名が分からない。既定値を騙るより、
+  // 「押せば選べる」ことだけを示す
+  modelStatus.text = name ? `$(mortar-board) ${name}` : "$(mortar-board) モデルを選択";
+  modelStatus.tooltip = new vscode.MarkdownString(
+    name
+      ? `QQQuestionAI が使用中のモデル: **${name}**\n\nクリックで切り替えます`
+      : "QQQuestionAI: クリックして使用するモデルを選びます"
+  );
+  modelStatus.show();
+}
+
+async function ensureBackendForModels(client: BackendClient): Promise<boolean> {
+  if (await client.health()) {
+    return true;
+  }
+  await startBackend(client);
+  if (await waitForHealth(client, 120_000)) {
+    return true;
+  }
+  output.show();
+  void vscode.window.showErrorMessage(
+    "QQQuestionAI: バックエンドを起動できなかったため、モデル一覧を取得できません（出力パネル参照）"
+  );
+  return false;
+}
+
+// コマンド「使用するモデルを選択」。一覧はバックエンド経由で Google から取る
+// （固定リストは必ず古くなるため）。取得できないときは内蔵の候補が返る。
+async function selectModel(client: BackendClient): Promise<void> {
+  if (!(await ensureBackendForModels(client))) {
+    return;
+  }
+  let list: ModelList;
+  try {
+    list = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "QQQuestionAI: 使えるモデルを取得中...",
+        cancellable: false,
+      },
+      () => client.models(true)
+    );
+  } catch (error) {
+    output.appendLine(`モデル一覧の取得に失敗: ${String(error)}`);
+    output.show();
+    void vscode.window.showErrorMessage(
+      "QQQuestionAI: モデル一覧を取得できませんでした（出力パネル参照）"
+    );
+    return;
+  }
+
+  if (list.fake_llm) {
+    // デモモードでは LLM を呼ばない。選んでも何も変わらないことを黙らない
+    void vscode.window.showWarningMessage(
+      "QQQuestionAI: デモモード (qqquestion.fakeLlm) が有効なため、選んだモデルは実際には使われません"
+    );
+  }
+
+  type Item = vscode.QuickPickItem & { value?: string; manual?: boolean };
+  const items: Item[] = list.models.map((entry) => ({
+    label: entry.name,
+    description: entry.name === list.current ? "$(check) 使用中" : "",
+    detail: entry.description || entry.label,
+    value: entry.name,
+  }));
+  items.push(
+    { label: "", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "既定にまかせる",
+      description: list.default,
+      detail: "設定を空にして、拡張が既定とするモデルを使う",
+      value: "",
+    },
+    { label: "モデル名を直接入力...", detail: "一覧に無いモデルを使う", manual: true }
+  );
+
+  const picked = await vscode.window.showQuickPick(items, {
+    title: "QQQuestionAI: 使用するモデルを選択",
+    placeHolder:
+      list.source === "api"
+        ? `現在: ${list.current}（この API キーで使えるモデル一覧）`
+        : `現在: ${list.current}（一覧を取得できなかったため内蔵の候補を表示しています）`,
+    ignoreFocusOut: true,
+  });
+  if (!picked) {
+    return;
+  }
+  let value = picked.value ?? "";
+  if (picked.manual) {
+    const input = await vscode.window.showInputBox({
+      title: "QQQuestionAI: 使用するモデル",
+      prompt: "モデル名を入力してください（空にすると既定に戻ります）",
+      value: list.current,
+      ignoreFocusOut: true,
+    });
+    if (input === undefined) {
+      return; // Esc でキャンセル
+    }
+    value = input.trim();
+  }
+  await applyModel(client, value, true);
+}
+
+// 設定への保存と、起動中バックエンドへの反映。
+async function applyModel(client: BackendClient, model: string, notify: boolean): Promise<void> {
+  // 保存先はグローバル設定。プロジェクトごとに変えたい人は settings.json を
+  // 直接編集すればよく、その変更も onDidChangeConfiguration で反映される
+  await config().update("model", model, vscode.ConfigurationTarget.Global);
+  try {
+    const body = await client.selectModel(model);
+    if (notify) {
+      void vscode.window.showInformationMessage(
+        `QQQuestionAI: モデルを ${body.current} に切り替えました`
+      );
+    }
+    output.appendLine(`使用モデル: ${body.previous} -> ${body.current}`);
+  } catch (error) {
+    // バックエンドに届かなかった場合は、プロセスを入れ直して QQQ_MODEL で渡す
+    output.appendLine(`モデルの即時反映に失敗したため再起動します: ${String(error)}`);
+    await restartBackend(client);
+    if (notify) {
+      void vscode.window.showInformationMessage(
+        `QQQuestionAI: モデルを ${model || "既定"} に切り替えました（バックエンド再起動）`
+      );
+    }
+  }
+  await refreshModelStatus(client);
 }
 
 function startPolling(client: BackendClient): void {
@@ -547,23 +698,41 @@ export function activate(context: vscode.ExtensionContext): void {
   globalStoragePath = context.globalStorageUri.fsPath;
   secrets = context.secrets;
   const client = new BackendClient(config().get<number>("port", 8756));
+  modelStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+  modelStatus.command = "qqquestion.selectModel";
 
   context.subscriptions.push(
     vscode.commands.registerCommand("qqquestion.startQuiz", () => startQuiz(client)),
     vscode.commands.registerCommand("qqquestion.startBackend", () => startBackend(client)),
     vscode.commands.registerCommand("qqquestion.installHook", () => installHook()),
     vscode.commands.registerCommand("qqquestion.setApiKey", () => setApiKey(client)),
+    vscode.commands.registerCommand("qqquestion.selectModel", () => selectModel(client)),
     vscode.commands.registerCommand("qqquestion.setupTerminalQuiz", () => setupTerminalQuiz()),
-    // ポートを変えると shim に焼き込んだ値が古くなるため作り直す
-    vscode.workspace.onDidChangeConfiguration((event) => {
+    vscode.workspace.onDidChangeConfiguration(async (event) => {
+      // ポートを変えると shim に焼き込んだ値が古くなるため作り直す
       if (event.affectsConfiguration("qqquestion.port")) {
         void registerQuizOnPath(context);
       }
+      // settings.json を直接編集した場合も、起動中のバックエンドに反映する
+      // （ここでは設定を書き戻さない。applyModel からの update と往復しないため）
+      if (event.affectsConfiguration("qqquestion.model")) {
+        try {
+          await client.selectModel(configuredModel());
+        } catch (error) {
+          output.appendLine(`設定変更をバックエンドに反映できませんでした: ${String(error)}`);
+        }
+        void refreshModelStatus(client);
+      }
     }),
+    modelStatus,
     output
   );
 
-  void startBackend(client);
+  void startBackend(client).then(async () => {
+    // 起動直後は health が通らないので、応答してから実際のモデル名を表示する
+    await waitForHealth(client, 120_000);
+    await refreshModelStatus(client);
+  });
   void registerQuizOnPath(context);
   startPolling(client);
 }
