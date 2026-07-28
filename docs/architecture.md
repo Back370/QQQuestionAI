@@ -212,7 +212,9 @@ class Explanation(BaseModel):
 ```python
 @dataclass
 class LearnerState:
-    topic_scores: dict[str, float]   # トピック別正答率
+    topic_scores: dict[str, float]   # トピック別正答率（直近 RECENT_WINDOW 件で算出）
+    topic_attempts: dict[str, int]   # 直近ウィンドウ内の解答数
+    stumbled_topics: set[str]        # 過去に一度でも不正解だったトピック
     current_hint_level: int          # 1(抽象) 〜 4(ほぼ核心)
     attempt_count: int
     history: list[Interaction]       # 全対話ログ (data/history.jsonl で永続化)
@@ -228,8 +230,12 @@ class LearnerState:
 
 ### 苦手傾向の反映（ルールベース）
 
-- `history.jsonl` からトピック別正答率を集計し、正答率 50% 未満のトピックを「苦手」と判定。次回セッションの出題で優先的に取り上げる
-- 出題難易度も `topic_scores` に応じて選択（正答率 70% 超で difficulty +1）
+- `history.jsonl` からトピック別正答率を集計し、正答率 50% 未満のトピックを「苦手」と判定
+- 正答率は**トピックごとに直近 `RECENT_WINDOW`(=5) 件**だけで見る。全履歴で平均すると一度の不正解が何セッションも残り、あとから正解できるようになっても苦手から抜けられない（＝克服が反映されない）
+- 苦手のうち**今回の差分に関係するもの**だけを優先出題に回す（`priority_topics()`、上限 `MAX_PRIORITY_TOPICS`(=3) 件）。無関係なトピックまで「優先出題」と指示すると、出題が差分から離れるか指示が丸ごと無視される。トピック名の照合は正規化した双方向の部分一致（履歴側の名前は LLM が付けるため差分側の語彙と完全一致しない）
+- 出題難易度も `topic_scores` に応じて選択（正答率 70% 超で difficulty +1、苦手は difficulty を下げる）。`difficulty_bias(diff_topics)` も同様に差分関連のトピックだけに絞る
+- つまずいた履歴があり直近では 70% 超で正解できているトピックは「克服した」として学習者に提示する（`overcome_topics()`、出題には使わない）
+- 「苦手一覧」と「今回優先出題するもの」は UI/ターミナルで別々に見せる。全部が毎回出題されるわけではないため（`format_learner_summary()`）
 - LLM に委ねず集計とルールで決定する（direction.md「あると良い機能」への対応）
 
 ---

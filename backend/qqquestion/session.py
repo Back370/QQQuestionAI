@@ -136,11 +136,12 @@ class QuizSession:
         コミットを通す（従来のスキップ相当）。
         """
         try:
+            weak_topics, difficulty_bias = self._learner_bias()
             question = generate_first_question(
                 self._llm,
                 self.diff_ctx,
-                weak_topics=self._learner.weak_topics(),
-                difficulty_bias=self._learner.difficulty_bias(),
+                weak_topics=weak_topics,
+                difficulty_bias=difficulty_bias,
             )
             self._states.append(self._make_state(question))
         except Exception as error:
@@ -162,13 +163,14 @@ class QuizSession:
         """
         if not self._states:
             return  # 第1問の生成に失敗している（prepare_first 側で処理済み）
+        weak_topics, difficulty_bias = self._learner_bias()
         try:
             for question in generate_remaining_questions_stream(
                 self._llm,
                 self.diff_ctx,
                 self._states[0].question,
-                weak_topics=self._learner.weak_topics(),
-                difficulty_bias=self._learner.difficulty_bias(),
+                weak_topics=weak_topics,
+                difficulty_bias=difficulty_bias,
             ):
                 if self.status != "in_progress":
                     return  # 準備中にパネルが閉じられた等
@@ -185,6 +187,17 @@ class QuizSession:
             # 準備完了前にユーザーが確定済みの全問を解き終えていた場合の後始末
             if self.finished and self.status == "in_progress":
                 self.status = "completed"
+
+    def _learner_bias(self) -> tuple[list[str], dict[str, int]]:
+        """出題プロンプトに載せる苦手傾向。今回の差分に関係するものだけに絞る。
+
+        苦手トピックを全部渡すと、差分と無関係なトピック（過去の別分野の履歴）
+        まで優先出題を指示することになり、出題が差分から離れるか指示が無視される。
+        """
+        return (
+            self._learner.priority_topics(self.diff_ctx.topics),
+            self._learner.difficulty_bias(self.diff_ctx.topics),
+        )
 
     def _make_state(self, question: Question) -> QuestionState:
         return QuestionState(

@@ -22,6 +22,7 @@ import sys
 import time
 from typing import Iterator
 
+from .learner_model import format_learner_summary
 from .terminput import enable_line_editing
 
 DEFAULT_PORT = 8756
@@ -246,8 +247,13 @@ def run(repo: str, port: int, model: str | None = None, list_models: bool = Fals
             print(f"使用モデル: {body['model']}（--model で切り替え / --list-models で一覧）")
         print(f"対象差分: {', '.join(body.get('files') or []) or '(不明)'}")
         print(f"抽出トピック: {' / '.join(body.get('topics') or []) or '(なし)'}")
-        if body.get("weak_topics"):
-            print(f"前回の苦手傾向: {' / '.join(body['weak_topics'])} → 優先出題します")
+        for line in format_learner_summary(
+            body.get("weak_topics") or [],
+            body.get("priority_topics") or [],
+            body.get("overcome_topics") or [],
+            body.get("weak_topic_scores") or {},
+        ):
+            print(line)
         if body.get("error"):
             print(f"\n警告: {body['error']}")
         print()

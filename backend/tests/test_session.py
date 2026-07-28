@@ -116,6 +116,35 @@ def test_hint_level_starts_at_2_for_weak_topic(demo_llm, kb, diff_ctx, tmp_path)
     assert session.current().hint_level == 2
 
 
+def test_unrelated_weak_topics_are_not_sent_to_the_generator(
+    demo_llm, kb, diff_ctx, tmp_path
+):
+    """今回の差分に関係しない苦手トピックは出題プロンプトに入れない（#18）。
+
+    履歴が溜まるほど無関係なトピックまで「優先的に出題」と指示され、出題が
+    差分から離れる／指示が丸ごと無視される、という偏りを防ぐ。
+    """
+    history = [
+        Interaction(session_id="old", question_id="q", topic=topic,
+                    first_verdict="incorrect", final_verdict="incorrect")
+        for topic in ("埋め込み表現", "誤差逆伝播")  # 前者は差分に無関係
+    ]
+    _make_session(demo_llm, kb, diff_ctx, tmp_path, LearnerState.from_history(history))
+
+    weak_lines = [
+        line
+        for call in demo_llm.calls
+        for line in call["user"].splitlines()
+        if line.startswith("学習者の苦手トピック")
+    ]
+    assert weak_lines, "苦手トピックの指示が出題プロンプトに入っていない"
+    for line in weak_lines:
+        assert "誤差逆伝播" in line  # 差分のトピック → 優先出題する
+        assert "埋め込み表現" not in line
+    # 推奨難易度の指定にも無関係なトピックを混ぜない
+    assert all("埋め込み表現" not in call["user"] for call in demo_llm.calls)
+
+
 def test_abort_marks_session(demo_llm, kb, diff_ctx, tmp_path):
     session = _make_session(demo_llm, kb, diff_ctx, tmp_path)
     session.give_up()

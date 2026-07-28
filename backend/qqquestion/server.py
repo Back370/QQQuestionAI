@@ -313,7 +313,12 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
             "topics": diff_ctx.topics,
             "files": diff_ctx.files,
             "kb_chunks": deps.kb.count(),
+            # weak_topics は苦手の全一覧、priority_topics はそのうち今回の差分に
+            # 関係するもの（実際に優先出題されるのはこちらだけ）
             "weak_topics": learner_state.weak_topics(),
+            "priority_topics": learner_state.priority_topics(diff_ctx.topics),
+            "overcome_topics": learner_state.overcome_topics(),
+            "weak_topic_scores": learner_state.weak_topic_scores(),
             "total": session.total,
             "error": session.error,
             # どのモデルで出題されたかを UI/ターミナルに出せるようにする。

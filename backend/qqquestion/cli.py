@@ -21,7 +21,7 @@ from .knowledge_base import (
     create_knowledge_base,
     create_search_provider,
 )
-from .learner_model import HistoryStore, load_learner_state
+from .learner_model import HistoryStore, format_learner_summary, load_learner_state
 from .llm import (
     LLMUnavailableError,
     available_models,
@@ -69,8 +69,14 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
     print(f"知識ベース: {kb.count()} チャンク (新規 {added})\n")
 
     learner_state = load_learner_state(data / "history.jsonl")
-    if learner_state.weak_topics():
-        print(f"前回の苦手傾向: {' / '.join(learner_state.weak_topics())} → 優先出題します\n")
+    summary = format_learner_summary(
+        learner_state.weak_topics(),
+        learner_state.priority_topics(diff_ctx.topics),
+        learner_state.overcome_topics(),
+        learner_state.weak_topic_scores(),
+    )
+    if summary:
+        print("\n".join(summary) + "\n")
 
     try:
         session = QuizSession(
