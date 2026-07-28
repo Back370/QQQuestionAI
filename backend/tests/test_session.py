@@ -126,6 +126,36 @@ def test_abort_marks_session(demo_llm, kb, diff_ctx, tmp_path):
     assert not report.completed
 
 
+def test_hint_after_partial_targets_only_missing_points(demo_llm, kb, diff_ctx, tmp_path):
+    """部分正解後のヒントは、満たせた要点を除いた残りだけを対象にする（issue #19）。"""
+    session = _make_session(demo_llm, kb, diff_ctx, tmp_path)
+    question = session.current().question
+
+    result = session.submit_answer("隠れ層に再帰結合があるから")
+    assert result.judgement.verdict == "partial"
+    matched = result.judgement.matched_points
+    missing = result.judgement.missing_points
+    assert matched and missing
+
+    session.request_hint()
+    hint_call = demo_llm.calls[-1]["user"]
+    # 学習者の実際の解答が渡っている（プレースホルダで捨てられていない）
+    assert "隠れ層に再帰結合があるから" in hint_call
+    for point in matched:
+        assert f"'{point}'" in hint_call.split("まだ満たせていない要点")[0]
+    assert f"まだ満たせていない要点(ヒントの対象。内容は漏らさない): {missing}" in hint_call
+    assert question.accepted_points  # 前提: 要点つきの問題で検証している
+
+
+def test_hint_without_any_answer_keeps_whole_question_scope(demo_llm, kb, diff_ctx, tmp_path):
+    """未回答でヒントを求めた場合は、絞り込みなしのヒントになる。"""
+    session = _make_session(demo_llm, kb, diff_ctx, tmp_path)
+    session.request_hint()
+    hint_call = demo_llm.calls[-1]["user"]
+    assert "既に満たせている要点" not in hint_call
+    assert "(未回答またはヒント要求)" in hint_call
+
+
 def test_hint_level_caps_at_4(demo_llm, kb, diff_ctx, tmp_path):
     session = _make_session(demo_llm, kb, diff_ctx, tmp_path)
     for _ in range(6):

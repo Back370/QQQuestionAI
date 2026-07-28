@@ -14,7 +14,7 @@ from typing import Iterator
 
 from .explainer import generate_explanation_stream
 from .hint_gen import generate_hint
-from .judge import judge_answer_stream
+from .judge import canonical_point, judge_answer_stream
 from .knowledge_base import KnowledgeBase
 from .learner_model import HistoryStore, LearnerState
 from .llm import StructuredLLM
@@ -44,6 +44,28 @@ class QuestionState:
     done: bool = False
     # 部分正解で満たした要点の蓄積。次の解答では残りの要点だけ埋まれば正解になる
     matched_points: list[str] = field(default_factory=list)
+    # 直近の解答。ヒントを「何が書けていないか」に絞るために保持する
+    last_answer: str = ""
+
+    def hint_focus(self) -> tuple[list[str], list[str]]:
+        """ヒントの対象（満たせた要点, 欠けている要点）。
+
+        matched_points を accepted_points の正規表現に写してから差を取る。
+        部分正解の実績がない（＝丸ごと不正解）ときは両方を空で返し、
+        従来どおり問題全体に向けたヒントにする。
+        """
+        accepted = self.question.accepted_points
+        if not accepted or not self.matched_points:
+            return [], []
+        matched: list[str] = []
+        for point in self.matched_points:
+            canonical = canonical_point(point, accepted)
+            if canonical is not None and canonical not in matched:
+                matched.append(canonical)
+        missing = [p for p in accepted if p not in matched]
+        if not matched or not missing:
+            return [], []
+        return matched, missing
 
 
 @dataclass
@@ -238,6 +260,7 @@ class QuizSession:
                 yield (name, payload)
         assert judgement is not None
         state.matched_points = list(judgement.matched_points)
+        state.last_answer = answer
 
         state.interaction.attempts += 1
         if state.interaction.first_verdict is None:
@@ -277,12 +300,15 @@ class QuizSession:
         # ヒントは全文が出そろってから答え漏洩チェックを通す必要があるため、
         # 途中経過を UI に流せない（ストリーミング非対応のまま）
         state = self.current()
+        matched, missing = state.hint_focus()
         hint, leaks = generate_hint(
             self._llm,
             self._kb,
             state.question,
-            user_answer="(未回答またはヒント要求)",
+            user_answer=state.last_answer or "(未回答またはヒント要求)",
             hint_level=state.hint_level,
+            matched_points=matched,
+            missing_points=missing,
         )
         state.interaction.hints_shown += 1
         state.interaction.max_hint_level = max(

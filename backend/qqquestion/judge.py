@@ -47,8 +47,11 @@ def _exact_match(question: Question, answer: str) -> bool:
     return any(normalize(candidate) == normalized_answer for candidate in candidates)
 
 
-def _canonical_point(point: str, accepted_points: Sequence[str]) -> str | None:
-    """LLM が返した要点文字列を accepted_points の正規の1つに対応付ける。"""
+def canonical_point(point: str, accepted_points: Sequence[str]) -> str | None:
+    """LLM が返した要点文字列を accepted_points の正規の1つに対応付ける。
+
+    session がヒントの対象（満たせた要点 / 欠けている要点）を求めるのにも使う。
+    """
     normalized = normalize(point)
     if not normalized:
         return None
@@ -69,7 +72,7 @@ def _merge_with_previous(
     """前回までに満たした要点と合算し、verdict を決定的に再計算する。"""
     matched: list[str] = []
     for point in [*already_matched, *judgement.matched_points]:
-        canonical = _canonical_point(point, question.accepted_points)
+        canonical = canonical_point(point, question.accepted_points)
         if canonical is not None and canonical not in matched:
             matched.append(canonical)
     missing = [p for p in question.accepted_points if p not in matched]
