@@ -121,11 +121,19 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
                 for url in hint.citations:
                     print(f"  出典: {url}")
                 continue
-            if user_input in ("ギブアップ", "giveup"):
-                _consume_stream(session.give_up_stream())
-                break
+            # 判定・解説の生成中に API が落ちる（タイムアウト等）ことがある。
+            # 生のトレースバックではなく、次の一手が分かる日本語を出す
+            try:
+                if user_input in ("ギブアップ", "giveup"):
+                    _consume_stream(session.give_up_stream())
+                    break
 
-            result = _consume_stream(session.submit_answer_stream(user_input))
+                result = _consume_stream(session.submit_answer_stream(user_input))
+            except LLMUnavailableError as error:
+                print(f"\n判定できませんでした: {error}")
+                session.abort()
+                print(session.report().render())
+                return 1
             if result.judgement.verdict == "correct":
                 break
         print()

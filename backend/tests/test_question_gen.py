@@ -187,3 +187,122 @@ def test_multi_question_is_rewritten(fake_llm, diff_ctx):
     # 書き直し呼び出しは1回だけ（他の4問は一問一答なので呼ばれない）
     rewrite_calls = [c for c in fake_llm.calls if c["schema"] == "Question"]
     assert len(rewrite_calls) == 1
+
+
+# ---- 問いと採点の一致（Issue #29） ------------------------------------
+
+
+def _assert_scope_rule(system: str) -> None:
+    """採点の要点を問題文が求める範囲に収めるよう指示していること。
+
+    問題文が聞いていない観点を accepted_points に入れると、学習者は問題文
+    どおりに答えても partial にされる（Issue #29）。
+    """
+    assert "問いと採点の一致の厳守" in system
+    assert "問題文が聞いていない観点を採点の要点にしない" in system
+    assert "その観点を問題文の側に明記する" in system
+    # 観点を書かせる副作用で答えを漏らさせない
+    assert "答えの内容" in system
+
+
+def test_scope_rule_in_batch_prompt(fake_llm, diff_ctx):
+    _enqueue_five(fake_llm)
+    generate_questions(fake_llm, diff_ctx)
+    _assert_scope_rule(fake_llm.calls[0]["system"])
+
+
+def test_scope_rule_in_first_question_prompt(fake_llm, diff_ctx):
+    from qqquestion.question_gen import generate_first_question
+
+    fake_llm.enqueue(_make_question("a", "prerequisite"))
+    generate_first_question(fake_llm, diff_ctx)
+    _assert_scope_rule(fake_llm.calls[0]["system"])
+
+
+def test_scope_rule_in_remaining_questions_prompt(fake_llm, diff_ctx):
+    from qqquestion.question_gen import generate_remaining_questions_stream
+
+    first = _make_question("q1", "prerequisite")
+    fake_llm.enqueue(
+        QuestionSet(
+            questions=[
+                _make_question("b", "prerequisite"),
+                _make_question("c", "implementation"),
+                _make_question("d", "implementation"),
+                _make_question("e", "implementation"),
+            ]
+        )
+    )
+    list(generate_remaining_questions_stream(fake_llm, diff_ctx, first))
+    _assert_scope_rule(fake_llm.calls[0]["system"])
+
+
+def test_single_question_rewrite_drops_unasked_points(fake_llm, diff_ctx):
+    """束ねた問いを絞るときは、聞かなくなった要点も採点から外させる。"""
+    from qqquestion.question_gen import _REWRITE_SYSTEM
+
+    assert "accepted_points から削る" in _REWRITE_SYSTEM
+
+
+def test_leaks_model_answer_detection():
+    from qqquestion.question_gen import leaks_model_answer
+
+    leaking = _make_question("a", "prerequisite").model_copy(
+        update={
+            "text": (
+                "メモリを過剰に消費してシステムが不安定になるのを防ぐために"
+                "読み込みサイズを制限しているのはなぜですか。"
+            ),
+            "model_answer": "メモリを過剰に消費してシステムが不安定になるのを防ぐため",
+        }
+    )
+    assert leaks_model_answer(leaking)
+
+    # 要点の語（「再帰結合」）を問題文で使わせるのは漏洩ではない
+    from qqquestion.demo import DEMO_QUESTIONS
+
+    assert not any(leaks_model_answer(q) for q in DEMO_QUESTIONS)
+
+
+def test_question_leaking_answer_is_rewritten(fake_llm, diff_ctx):
+    leaking = _make_question("a", "prerequisite").model_copy(
+        update={
+            "text": "答えは「読み込みサイズを制限してメモリ枯渇を防ぐこと」ですが、なぜですか。",
+            "model_answer": "読み込みサイズを制限してメモリ枯渇を防ぐこと",
+        }
+    )
+    fake_llm.enqueue(
+        QuestionSet(
+            questions=[
+                leaking,
+                _make_question("b", "prerequisite"),
+                _make_question("c", "implementation"),
+                _make_question("d", "implementation"),
+                _make_question("e", "implementation"),
+            ]
+        )
+    )
+    fake_llm.enqueue(
+        Question(
+            id="wrong-id",
+            type="implementation",
+            text="読み込みサイズを制限しているのはなぜですか。",
+            model_answer="書き直し側の模範解答（採用されない）",
+            accepted_points=["書き直し側の要点（採用されない）"],
+            rubric="書き直し側の基準（採用されない）",
+            topic="別トピック",
+            difficulty=3,
+        )
+    )
+    questions = generate_questions(fake_llm, diff_ctx)
+    repaired = questions[0]
+    assert repaired.text == "読み込みサイズを制限しているのはなぜですか。"
+    # 書き直させるのは問題文だけ。採点側は出題時に確定した値を維持する
+    assert repaired.model_answer == "読み込みサイズを制限してメモリ枯渇を防ぐこと"
+    assert repaired.accepted_points == ["要点"]
+    assert repaired.rubric == "要点があれば正解"
+    assert repaired.id == "q1" and repaired.type == "prerequisite"
+    assert repaired.topic == "RNN"
+    rewrite_calls = [c for c in fake_llm.calls if c["schema"] == "Question"]
+    assert len(rewrite_calls) == 1
+    assert "答えそのもの" in rewrite_calls[0]["system"]

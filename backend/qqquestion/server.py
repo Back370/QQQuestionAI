@@ -173,23 +173,31 @@ def _sse_response(session: QuizSession, events: Iterator[tuple[str, object]]):
     """
 
     def generate() -> Iterator[str]:
-        for name, payload in events:
-            if name == "result":
-                data = _answer_payload(payload)
-                data["next_question"] = session.current_public()
-                data["status"] = session.status
-                yield _sse("result", data)
-            elif name == "judgement":
-                done = payload["question_done"]  # type: ignore[index]
-                data = {
-                    "judgement": _public_judgement(payload["judgement"], done),  # type: ignore[index]
-                    "question_done": done,
-                }
-                if done:
-                    data["model_answer"] = payload["model_answer"]  # type: ignore[index]
-                yield _sse("judgement", data)
-            else:  # judgement_partial / explanation_partial
-                yield _sse(name, payload)  # type: ignore[arg-type]
+        try:
+            for name, payload in events:
+                if name == "result":
+                    data = _answer_payload(payload)
+                    data["next_question"] = session.current_public()
+                    data["status"] = session.status
+                    yield _sse("result", data)
+                elif name == "judgement":
+                    done = payload["question_done"]  # type: ignore[index]
+                    data = {
+                        "judgement": _public_judgement(payload["judgement"], done),  # type: ignore[index]
+                        "question_done": done,
+                    }
+                    if done:
+                        data["model_answer"] = payload["model_answer"]  # type: ignore[index]
+                    yield _sse("judgement", data)
+                else:  # judgement_partial / explanation_partial
+                    yield _sse(name, payload)  # type: ignore[arg-type]
+        except Exception as error:
+            # SSE は先にヘッダを 200 で返しているため、ここで例外を投げると
+            # 接続が黙って切れるだけで、失敗の理由がクライアントに届かない
+            # （LLM のタイムアウト等が「何も起きない」に見える / issue #28）。
+            # error イベントとして流し、UI に日本語の理由を出させる。
+            logger.exception("ストリーム処理に失敗しました: session=%s", session.id)
+            yield _sse("error", {"message": str(error)})
 
     return StreamingResponse(
         generate(),

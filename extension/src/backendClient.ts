@@ -53,9 +53,10 @@ export interface ModelList {
 }
 
 // /answer/stream, /giveup/stream (SSE) の1イベント。
-// event: "judgement_partial" | "judgement" | "explanation_partial" | "result"
+// event: "judgement_partial" | "judgement" | "explanation_partial" | "result" | "error"
 export interface StreamEvent {
   event: string;
+  message?: string;
   reason?: string;
   explanation?: string | AnswerResponse["explanation"];
   judgement?: Judgement;

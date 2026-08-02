@@ -253,6 +253,21 @@ def _fast_thinking_kwargs(model_name: str) -> dict[str, object]:
     return {"thinking_budget": 0}
 
 
+def _supports_response_schema() -> bool:
+    """インストール済みの langchain-google-genai が response_schema を持つか。
+
+    ChatGoogleGenerativeAI は extra="ignore" なので、対応していない版に渡すと
+    **黙って捨てられる**。捨てられたことに気づかずスキーマをプロンプトからも
+    外すと、制約なしの自由生成に静かに退行するため、渡す前に必ず確認する
+    （_fast_thinking_kwargs の引数名を検査しているのと同じ理由）。
+    """
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+    except Exception:
+        return False
+    return "response_schema" in ChatGoogleGenerativeAI.model_fields
+
+
 def _classify_llm_error(error: Exception) -> str:
     """LLM 呼び出しの失敗を、利用者が次の一手を打てる日本語メッセージに変換する。"""
     text = str(error).lower()
@@ -394,6 +409,35 @@ class GeminiLLM:
             )
             return self.generate(schema, system, user, temperature=temperature)
 
+    def _stream_json_setup(self, schema: type[T], system: str) -> tuple[dict, str]:
+        """ストリーミング用の (ChatGoogleGenerativeAI 引数, system プロンプト)。
+
+        非ストリームの generate() は with_structured_output（既定 method=
+        "json_schema"）で **制約付きデコード**（response_json_schema）を使う。
+        ストリーミング側で同じ制約を掛けないと、モデルはスキーマを
+        「プロンプトに書かれた指示」として自力で守るしかなく、
+        入力（スキーマ全文の貼り付け）も出力（自由生成）も膨らむ。
+        その結果ストリームだけが飛び抜けて遅くなり、_llm_timeout() の値が
+        そのままサーバ側デッドライン（X-Server-Timeout ヘッダ）として送られる
+        ため、生成が終わる前に 504 DEADLINE_EXCEEDED でストリームごと
+        打ち切られる（issue #28）。制約付きデコードが使える版では
+        スキーマを API 側に渡し、プロンプトからは外す。
+        """
+        extra: dict = {"response_mime_type": "application/json"}
+        note = (
+            "\n\n出力は指定されたスキーマに従う JSON オブジェクトのみとし、"
+            "コードフェンスや前置きを付けないこと。"
+        )
+        if _supports_response_schema():
+            extra["response_schema"] = schema.model_json_schema()
+        else:
+            # 旧版フォールバック。制約が掛からないぶん遅く・崩れやすいので、
+            # スキーマはプロンプトで渡す（従来どおりの挙動）
+            note += "\nJSON Schema:\n" + json.dumps(
+                schema.model_json_schema(), ensure_ascii=False
+            )
+        return extra, system + note
+
     def generate_stream(
         self, schema: type[T], system: str, user: str, temperature: float = 0.0
     ) -> Iterator[StreamEvent]:
@@ -401,24 +445,23 @@ class GeminiLLM:
 
         ストリーム途中の失敗・最終検証エラー時は非ストリームの generate() に
         フォールバックする（呼び出し側は snapshot 置き換えで表示する前提）。
-        API 自体が使えない場合は generate() 側で LLMUnavailableError になる。
+        ただし API 自体が使えない失敗（タイムアウト・レート制限・認証・モデル
+        不在）は、非ストリームで作り直しても同じく失敗し、タイムアウトぶんの
+        待ち時間が二重になるだけなので、そのまま LLMUnavailableError にする
+        （generate_fast と同じ判断）。
         """
         self._require_key()
         from langchain_core.messages import HumanMessage, SystemMessage
         from langchain_core.utils.json import parse_partial_json
 
-        schema_note = (
-            "\n\n出力は次の JSON Schema に従う JSON オブジェクトのみとし、"
-            "コードフェンスや前置きを付けないこと:\n"
-            + json.dumps(schema.model_json_schema(), ensure_ascii=False)
-        )
-        chat = self._chat(temperature, response_mime_type="application/json")
         buffer = ""
         last_partial: dict | None = None
         final: T | None = None
         try:
+            extra, system_text = self._stream_json_setup(schema, system)
+            chat = self._chat(temperature, **extra)
             for chunk in chat.stream(
-                [SystemMessage(content=system + schema_note), HumanMessage(content=user)]
+                [SystemMessage(content=system_text), HumanMessage(content=user)]
             ):
                 buffer += _chunk_text(chunk.content)
                 try:
@@ -430,6 +473,16 @@ class GeminiLLM:
                     yield ("partial", partial)
             final = schema.model_validate(json.loads(_strip_fences(buffer)))
         except Exception as error:
+            if _is_unavailable_error(error):
+                # issue #28: 45秒のデッドラインを使い切ってから更に45秒待つ、を防ぐ
+                logger.warning(
+                    "ストリーミング生成に失敗（API利用不能のためフォールバックしない）: "
+                    "model=%s schema=%s error=%r",
+                    self._model_name,
+                    schema.__name__,
+                    error,
+                )
+                raise LLMUnavailableError(_classify_llm_error(error)) from error
             logger.info(
                 "ストリーミング生成に失敗したため非ストリーム生成へフォールバック: "
                 "model=%s schema=%s error=%r",

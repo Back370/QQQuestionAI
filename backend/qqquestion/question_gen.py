@@ -4,6 +4,10 @@
 返答が構成を満たさない場合はコード側で並べ替え・補正して強制する。
 模範解答・許容解答・採点基準を出題時に確定させるのが
 ハルシネーション抑制の要（判定時の自由生成を減らす）。
+
+採点の要点(accepted_points)は問題文が求めている範囲に収める（Issue #29）。
+問題文が聞いていない観点を要点にすると、学習者は問題文どおりに答えても
+部分正解にされ、何を書き足せばよいか分からなくなる。
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from pydantic import ValidationError
 
 from .llm import StructuredLLM, fast_generate, stream_generate
 from .models import DiffContext, Question, QuestionSet
+from .textutil import contains_answer
 
 PERSONA = (
     "あなたは「答えを絶対に教えず、ヒントだけで理解に導く教師」です。"
@@ -28,6 +33,20 @@ _DIFFICULTY_GUIDE = """- difficulty: 問いの深さ。次の定義に厳密に�
   - 1: 用語や API の意味・役割を答えられれば済む問い（知っているか）
   - 2: そのコードで何が起きるか、挙動やデータの流れを説明する問い（何が起きるか）
   - 3: なぜその書き方を選んだか、選ばなかった場合に何が起きるかまで説明する問い（なぜそう書くか）"""
+
+# 問いと採点の一致（Issue #29）。「なぜ io.LimitReader を使うのか」という問いに対して
+# accepted_points 側だけが「メモリ枯渇の防止」まで要求していると、学習者は問題文どおりに
+# 答えても partial にされる。求める観点は問題文に書かせ、書けない（＝答えを漏らす）
+# 観点は要点から外させる。
+_SCOPE_RULE = """問いと採点の一致の厳守:
+- accepted_points に入れる要点は「問題文だけを読んで、それを書くべきだと分かる」もの
+  だけにする。問題文が聞いていない観点を採点の要点にしない
+- 複数の観点に答えてほしいときは、その観点を問題文の側に明記する
+  （例:「〜はなぜですか。通信量の面だけでなく、プログラムを動かす側の資源の面からも
+  説明してください。」）
+- 問題文に書くのは「どの方向の話を求めているか」だけ。答えの内容
+  （model_answer や accepted_points が述べている結論）は問題文に書かない
+- 観点を書き足しても問いは1つのままにする（「それぞれ」「また」で問いを増やさない）"""
 
 # 難易度の配分。定義だけ与えても全問が同じレベルに揃いやすいので、散らすことを明示する。
 # 推奨難易度（difficulty_bias）は学習者の実績に基づくため、配分より優先させる。
@@ -52,6 +71,8 @@ _SYSTEM = PERSONA + """
 
 """ + _DIFFICULTY_SPREAD + """
 
+""" + _SCOPE_RULE + """
+
 出題形式の厳守（記述式の一問一答）:
 - 1問につき問いは1つだけ。「それぞれ説明してください」「〜ですか？また、〜ですか？」のように
   複数の論点を1問に束ねない
@@ -65,8 +86,19 @@ _REWRITE_SYSTEM = PERSONA + """
 最も本質的な問い1つだけに絞って書き直してください。
 
 - 疑問文は1つだけにする。「それぞれ」「また〜も」を使わない
-- model_answer / accepted_points / rubric も絞った問いに対応させる
+- model_answer / accepted_points / rubric も絞った問いに対応させる。
+  絞った問いが求めていない要点は accepted_points から削る（問題文が聞いていない
+  ことを採点で要求しない）
 - id / type / topic / difficulty / code_snippet は変えない
+"""
+
+_LEAK_REWRITE_SYSTEM = PERSONA + """
+次の問題は、問題文に答えそのもの（模範解答の内容）を書いてしまっています。
+これでは学習者が考える余地がありません。問題文(text)だけを書き直してください。
+
+- 求める観点（どの方向の話を答えてほしいか）だけを残し、結論・答えは書かない
+- 問いは1つだけにする
+- text 以外のフィールドは変えない
 """
 
 # 「？が2つ以上」「それぞれ」「？の直後に また/さらに/加えて」を複数質問とみなす
@@ -81,6 +113,18 @@ def is_multi_question(text: str) -> bool:
     if "それぞれ" in text:
         return True
     return bool(_FOLLOWUP_RE.search(text))
+
+
+# 問題文が模範解答を丸ごと含んでいるとみなす最小長。_SCOPE_RULE で「求める観点を
+# 問題文に書く」ように促した副作用として、答えまで書いてしまう生成を弾くための保険。
+# 「再帰結合という語を使って説明してください」のように要点の語が問題文に出るのは
+# 正常なので、照合の対象は model_answer だけにし、短い模範解答は見逃す側に倒す。
+_MIN_LEAK_LEN = 16
+
+
+def leaks_model_answer(question: Question) -> bool:
+    """問題文が模範解答をそのまま含んでいないか。"""
+    return contains_answer(question.text, [question.model_answer], min_len=_MIN_LEAK_LEN)
 
 
 def _rewrite_as_single_question(llm: StructuredLLM, question: Question) -> Question:
@@ -100,6 +144,26 @@ def _rewrite_as_single_question(llm: StructuredLLM, question: Question) -> Quest
             "code_snippet": question.code_snippet,
         }
     )
+
+
+def _rewrite_without_answer(llm: StructuredLLM, question: Question) -> Question:
+    """答えを書いてしまった問題文だけを書き直す（他フィールドは据え置き）。"""
+    rewritten = llm.generate(
+        Question,
+        _LEAK_REWRITE_SYSTEM,
+        question.model_dump_json(),
+        temperature=0.2,
+    )
+    return question.model_copy(update={"text": rewritten.text})
+
+
+def _repair_question(llm: StructuredLLM, question: Question) -> Question:
+    """出題形式の違反をコード側で補正する（一問一答・答えの漏洩）。"""
+    if is_multi_question(question.text):
+        question = _rewrite_as_single_question(llm, question)
+    if leaks_model_answer(question):
+        question = _rewrite_without_answer(llm, question)
+    return question
 
 
 # 5問構成: 前提知識×2 → 実装の説明×3（architecture.md §5.2 (a)）
@@ -197,7 +261,11 @@ def _stream_question_set(
             except ValidationError:
                 frozen = True
                 break
-            if question.type != expected[index] or is_multi_question(question.text):
+            if (
+                question.type != expected[index]
+                or is_multi_question(question.text)
+                or leaks_model_answer(question)
+            ):
                 frozen = True
                 break
             published += 1
@@ -207,10 +275,8 @@ def _stream_question_set(
         raise ValueError(f"出題が{len(expected)}問未満です: {len(final_set.questions)}問")
     # 部分パースで確定した問題は最終リストの先頭 published 件と同一
     for question in _fill_structure(start_slot + published, final_set.questions[published:]):
-        # 一問一答の強制: 複数の問いを束ねた問題は1問に絞って書き直させる
-        if is_multi_question(question.text):
-            question = _rewrite_as_single_question(llm, question)
-        yield question
+        # 一問一答の強制（複数の問いは1問に絞る）と、答えを書いた問題文の書き直し
+        yield _repair_question(llm, question)
 
 
 _FIRST_SYSTEM = PERSONA + """
@@ -226,6 +292,8 @@ _FIRST_SYSTEM = PERSONA + """
 
 第1問は導入なので difficulty は 1 か 2 とする（3 にしない）。
 ただしトピック別の推奨難易度が指定されている場合は、そちらを優先する。
+
+""" + _SCOPE_RULE + """
 
 出題形式の厳守（記述式の一問一答）:
 - 問いは1つだけ。複数の論点を束ねず、疑問文は1つまで
@@ -253,6 +321,8 @@ _REST_SYSTEM = PERSONA + """
 """ + _DIFFICULTY_SPREAD + """
 - 第1問（出題済み）の難易度は下に示す。第2〜5問の中で難易度1と難易度3を1問以上ずつ満たす
 
+""" + _SCOPE_RULE + """
+
 出題形式の厳守（記述式の一問一答）:
 - 1問につき問いは1つだけ。複数の論点を束ねず、疑問文は各問1つまで
 - 選択式にしない。日本語で出題する
@@ -272,9 +342,7 @@ def generate_first_question(
     user = _build_user(diff_ctx, weak_topics, difficulty_bias)
     question = fast_generate(llm, Question, _FIRST_SYSTEM, user, temperature=0.4)
     question = question.model_copy(update={"id": "q1", "type": "prerequisite"})
-    if is_multi_question(question.text):
-        question = _rewrite_as_single_question(llm, question)
-    return question
+    return _repair_question(llm, question)
 
 
 def generate_remaining_questions_stream(

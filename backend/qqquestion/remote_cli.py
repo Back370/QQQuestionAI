@@ -111,6 +111,9 @@ def _consume_stream(client, url: str, json_body: dict | None = None) -> dict | N
                 explanation.update(event.get("explanation", ""))
             elif name == "result":
                 result = event
+            elif name == "error":
+                # 生成がタイムアウト等で中断した。理由を出して先へ進ませる
+                print(f"\n[生成に失敗しました] {event.get('message', '')}")
     if explanation.started:
         print()
         citations = ((result or {}).get("explanation") or {}).get("citations") or []
