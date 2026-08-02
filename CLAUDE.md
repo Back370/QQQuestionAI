@@ -30,13 +30,15 @@ npx @vscode/vsce package --allow-missing-repository  # 配布用 .vsix を作成
 # クイズ実行（コミットしない。pip install -e . で quiz コマンドが入る）
 quiz                                      # ステージ済み差分から出題
 QQQ_FAKE_LLM=1 quiz --demo                # APIキー不要のデモ
+quiz --list-models                        # APIキーで使えるモデル一覧（* が現在）
+quiz --model gemini-3.5-flash             # モデルを切り替えて出題（再起動不要）
 
 # （任意）コミットをゲートしたい人だけ: pre-commit フックを対象リポジトリに導入
 scripts/install_quiz_hook.sh              # フックのみ導入（シェル設定は変更しない）
 QQQ_QUIZ=1 git commit -m "..."            # 明示指定した時だけクイズが発動する
 ```
 
-主要な環境変数: `GOOGLE_API_KEY`（Gemini）、`QQQ_FAKE_LLM=1`（APIキー不要のデモ）、`QQQ_PORT`（既定 8756）、`QQQ_DATA_DIR`（履歴/知識ベース/サーバログ `server.log` の保存先、既定 `data/`。生成失敗の原因調査はまずこのログを見る）、`QQQ_NO_SEARCH=1`（Web検索無効化）、`TAVILY_API_KEY`（検索。無ければ ddgs）、`QQQ_LOG_POLLING=1`（既定では抑制している拡張のポーリング（`/health`・`/quiz/pending`）の成功アクセスログも残す。ポーリング自体を調べたいとき用）。APIキーは `backend/env.example` を `backend/.env` にコピーして設定できる（サーバ/CLI起動時に自動読み込み。既存の環境変数が優先）。AGENTS.mdの安全ルール2のとおり、AIエージェントは `.env` を読まない・コミットしない。
+主要な環境変数: `GOOGLE_API_KEY`（Gemini）、`QQQ_MODEL`（使用モデル。**通常は自分で設定せず**、VSCode ならステータスバー／コマンド「使用するモデルを選択」、ターミナルなら `quiz --model` で切り替える。一覧は Google の ListModels から取得し、取れないときは `llm.FALLBACK_MODELS` を出す）、`QQQ_FAKE_LLM=1`（APIキー不要のデモ）、`QQQ_PORT`（既定 8756）、`QQQ_DATA_DIR`（履歴/知識ベース/サーバログ `server.log` の保存先、既定 `data/`。生成失敗の原因調査はまずこのログを見る）、`QQQ_NO_SEARCH=1`（Web検索無効化）、`TAVILY_API_KEY`（検索。無ければ ddgs）、`QQQ_LOG_POLLING=1`（既定では抑制している拡張のポーリング（`/health`・`/quiz/pending`）の成功アクセスログも残す。ポーリング自体を調べたいとき用）。APIキーは `backend/env.example` を `backend/.env` にコピーして設定できる（サーバ/CLI起動時に自動読み込み。既存の環境変数が優先）。AGENTS.mdの安全ルール2のとおり、AIエージェントは `.env` を読まない・コミットしない。
 
 ## Architecture Overview
 

@@ -37,6 +37,10 @@
         "title": "QQQuestionAI: API キーを設定"
       },
       {
+        "command": "qqquestion.selectModel",
+        "title": "QQQuestionAI: 使用するモデルを選択"
+      },
+      {
         "command": "qqquestion.setupTerminalQuiz",
         "title": "QQQuestionAI: ターミナルの quiz コマンドを設定"
       }
@@ -53,6 +57,11 @@
           "type": "number",
           "default": 8756,
           "description": "バックエンドのポート (QQQ_PORT)"
+        },
+        "qqquestion.model": {
+          "type": "string",
+          "default": "",
+          "description": "使用する Gemini のモデル名 (QQQ_MODEL)。空なら拡張の既定モデル。コマンドパレットの「QQQuestionAI: 使用するモデルを選択」やステータスバーから、API キーで実際に使える一覧を見て選べる"
         },
         "qqquestion.fakeLlm": {
           "type": "boolean",

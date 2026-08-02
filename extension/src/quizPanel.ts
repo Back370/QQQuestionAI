@@ -191,6 +191,11 @@ export class QuizPanel {
         this.postResult(result as unknown as AnswerResponse);
         break;
       }
+      case "error":
+        // ストリーム途中の生成失敗（LLM のタイムアウト等）。接続が黙って
+        // 切れる代わりに理由が届くので、そのまま利用者に見せる
+        this.post({ type: "error", message: event.message ?? "生成に失敗しました" });
+        break;
     }
   }
 

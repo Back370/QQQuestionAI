@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 from qqquestion.demo import build_demo_llm
 from qqquestion.diff_analyzer import analyze
 from qqquestion.knowledge_base import InMemoryKnowledgeBase
+from qqquestion.models import Interaction
 from qqquestion.server import AppDeps, create_app
 
 from .conftest import SAMPLE_DIFF
@@ -45,6 +46,34 @@ def test_question_payload_has_no_answer(client):
     serialized = str(body)
     assert "model_answer" not in serialized
     assert "rubric" not in serialized
+
+
+def test_start_separates_weak_topics_from_prioritized_ones(client, tmp_path):
+    """苦手の全一覧と「今回優先出題するもの」を別々に返す（#18）。
+
+    ターミナル側が「苦手 = 全部いま出題される」と誤解させる表示をしないため。
+    """
+    history = tmp_path / "history.jsonl"
+    history.write_text(
+        "".join(
+            Interaction(
+                session_id="old",
+                question_id="q1",
+                topic=topic,
+                first_verdict="incorrect",
+                final_verdict="incorrect",
+            ).model_dump_json()
+            + "\n"
+            # 誤差逆伝播 は SAMPLE_DIFF のトピック、埋め込み表現 は無関係
+            for topic in ("誤差逆伝播", "埋め込み表現")
+        ),
+        encoding="utf-8",
+    )
+    body = client.post("/quiz/start", json={"repo_path": "."}).json()
+    assert set(body["weak_topics"]) == {"誤差逆伝播", "埋め込み表現"}
+    assert body["priority_topics"] == ["誤差逆伝播"]
+    assert body["overcome_topics"] == []
+    assert body["weak_topic_scores"]["誤差逆伝播"] == 0.0
 
 
 def test_full_flow_via_api(client):

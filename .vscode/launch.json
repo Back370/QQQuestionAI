@@ -7,8 +7,16 @@
       "name": "拡張機能を実行 (Extension Development Host)",
       "type": "extensionHost",
       "request": "launch",
-      // 拡張の実体はリポジトリ直下ではなく extension/ にある
-      "args": ["--extensionDevelopmentPath=${workspaceFolder}/extension"],
+      // 拡張の実体はリポジトリ直下ではなく extension/ にある。
+      // --disable-extensions: Marketplace からインストール済みの QQQuestionAI が
+      // 開発ホスト側でも起動してしまうと、先にポート 8756 を掴んだ「配布版の」
+      // バックエンドに開発中の拡張がぶら下がり、直したはずのコードが動かない
+      // （extension.ts の startBackend は health が通ると起動を省略する）。
+      // 詳細と、他ウィンドウ側の配布版まで含めた手順は backend/README.md を参照。
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/extension",
+        "--disable-extensions"
+      ],
       "outFiles": ["${workspaceFolder}/extension/out/**/*.js"],
       "preLaunchTask": "compile-extension"
     }

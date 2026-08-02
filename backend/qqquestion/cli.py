@@ -21,8 +21,14 @@ from .knowledge_base import (
     create_knowledge_base,
     create_search_provider,
 )
-from .learner_model import HistoryStore, load_learner_state
-from .llm import LLMUnavailableError, create_llm
+from .learner_model import HistoryStore, format_learner_summary, load_learner_state
+from .llm import (
+    LLMUnavailableError,
+    available_models,
+    create_llm,
+    current_model_name,
+    set_current_model,
+)
 from .session import QuizSession
 from .terminput import enable_line_editing
 
@@ -55,14 +61,22 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
     builder = KnowledgeBaseBuilder(kb, create_search_provider(), data / "kb_cache.json")
 
     print(BANNER)
+    if not demo:
+        print(f"使用モデル: {current_model_name()}（--model で切り替え / --list-models で一覧）")
     print(f"対象差分: {', '.join(diff_ctx.files) or '(不明)'}")
     print(f"抽出トピック: {' / '.join(diff_ctx.topics) or '(なし)'}")
     added = builder.build_for_topics(diff_ctx.topics)
     print(f"知識ベース: {kb.count()} チャンク (新規 {added})\n")
 
     learner_state = load_learner_state(data / "history.jsonl")
-    if learner_state.weak_topics():
-        print(f"前回の苦手傾向: {' / '.join(learner_state.weak_topics())} → 優先出題します\n")
+    summary = format_learner_summary(
+        learner_state.weak_topics(),
+        learner_state.priority_topics(diff_ctx.topics),
+        learner_state.overcome_topics(),
+        learner_state.weak_topic_scores(),
+    )
+    if summary:
+        print("\n".join(summary) + "\n")
 
     try:
         session = QuizSession(
@@ -107,11 +121,19 @@ def run(repo_path: str, data_dir: str, diff_file: str | None, demo: bool) -> int
                 for url in hint.citations:
                     print(f"  出典: {url}")
                 continue
-            if user_input in ("ギブアップ", "giveup"):
-                _consume_stream(session.give_up_stream())
-                break
+            # 判定・解説の生成中に API が落ちる（タイムアウト等）ことがある。
+            # 生のトレースバックではなく、次の一手が分かる日本語を出す
+            try:
+                if user_input in ("ギブアップ", "giveup"):
+                    _consume_stream(session.give_up_stream())
+                    break
 
-            result = _consume_stream(session.submit_answer_stream(user_input))
+                result = _consume_stream(session.submit_answer_stream(user_input))
+            except LLMUnavailableError as error:
+                print(f"\n判定できませんでした: {error}")
+                session.abort()
+                print(session.report().render())
+                return 1
             if result.judgement.verdict == "correct":
                 break
         print()
@@ -188,12 +210,33 @@ def _print_verdict(payload, streamed_reason: bool) -> None:
         print("先生> 残念、違います。「ヒント」と言ってくれれば手がかりを出しますよ。")
 
 
+def print_models() -> None:
+    """選べるモデルを一覧表示する（* が現在のモデル）。"""
+    entries, source = available_models()
+    current = current_model_name()
+    if source == "fallback":
+        print("（APIから一覧を取得できませんでした。内蔵の候補を表示します）")
+    for entry in entries:
+        mark = "*" if entry["name"] == current else " "
+        note = entry["description"] or entry["label"]
+        print(f" {mark} {entry['name']}  {note}".rstrip())
+    print("\n切り替え: --model <モデル名>（環境変数 QQQ_MODEL、backend/.env でも指定可）")
+
+
 def main() -> None:
     from .envfile import load_env_file
 
     load_env_file()  # backend/.env から GOOGLE_API_KEY 等を読み込む（任意）
     parser = argparse.ArgumentParser(description="QQQuestionAI 理解度チェック CLI")
     parser.add_argument("--repo", default=".", help="対象リポジトリ")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="使用するモデル名（既定: $QQQ_MODEL または内蔵の既定モデル）",
+    )
+    parser.add_argument(
+        "--list-models", action="store_true", help="使えるモデルを一覧表示して終了"
+    )
     parser.add_argument(
         "--data-dir",
         # server.py と揃える。拡張が生成する shim は書き込み可能な場所を渡す
@@ -203,6 +246,11 @@ def main() -> None:
     parser.add_argument("--diff-file", default=None, help="差分ファイルから出題（デバッグ用）")
     parser.add_argument("--demo", action="store_true", help="APIキー不要のデモモード")
     args = parser.parse_args()
+    if args.model:
+        set_current_model(args.model)
+    if args.list_models:
+        print_models()
+        sys.exit(0)
     sys.exit(run(args.repo, args.data_dir, args.diff_file, args.demo))
 
 

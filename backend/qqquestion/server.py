@@ -30,7 +30,14 @@ from .knowledge_base import (
     create_search_provider,
 )
 from .learner_model import HistoryStore, load_learner_state
-from .llm import StructuredLLM, create_llm
+from .llm import (
+    DEFAULT_MODEL,
+    StructuredLLM,
+    available_models,
+    create_llm,
+    current_model_name,
+    set_current_model,
+)
 from .models import DiffContext, QuizOrigin
 from .session import QuizSession
 
@@ -93,6 +100,11 @@ class StartRequest(BaseModel):
 
 class AnswerRequest(BaseModel):
     answer: str
+
+
+class SelectModelRequest(BaseModel):
+    # 空文字 / null は「既定モデルに戻す」
+    model: str | None = None
 
 
 def _normalize_path(p: str) -> str:
@@ -161,23 +173,31 @@ def _sse_response(session: QuizSession, events: Iterator[tuple[str, object]]):
     """
 
     def generate() -> Iterator[str]:
-        for name, payload in events:
-            if name == "result":
-                data = _answer_payload(payload)
-                data["next_question"] = session.current_public()
-                data["status"] = session.status
-                yield _sse("result", data)
-            elif name == "judgement":
-                done = payload["question_done"]  # type: ignore[index]
-                data = {
-                    "judgement": _public_judgement(payload["judgement"], done),  # type: ignore[index]
-                    "question_done": done,
-                }
-                if done:
-                    data["model_answer"] = payload["model_answer"]  # type: ignore[index]
-                yield _sse("judgement", data)
-            else:  # judgement_partial / explanation_partial
-                yield _sse(name, payload)  # type: ignore[arg-type]
+        try:
+            for name, payload in events:
+                if name == "result":
+                    data = _answer_payload(payload)
+                    data["next_question"] = session.current_public()
+                    data["status"] = session.status
+                    yield _sse("result", data)
+                elif name == "judgement":
+                    done = payload["question_done"]  # type: ignore[index]
+                    data = {
+                        "judgement": _public_judgement(payload["judgement"], done),  # type: ignore[index]
+                        "question_done": done,
+                    }
+                    if done:
+                        data["model_answer"] = payload["model_answer"]  # type: ignore[index]
+                    yield _sse("judgement", data)
+                else:  # judgement_partial / explanation_partial
+                    yield _sse(name, payload)  # type: ignore[arg-type]
+        except Exception as error:
+            # SSE は先にヘッダを 200 で返しているため、ここで例外を投げると
+            # 接続が黙って切れるだけで、失敗の理由がクライアントに届かない
+            # （LLM のタイムアウト等が「何も起きない」に見える / issue #28）。
+            # error イベントとして流し、UI に日本語の理由を出させる。
+            logger.exception("ストリーム処理に失敗しました: session=%s", session.id)
+            yield _sse("error", {"message": str(error)})
 
     return StreamingResponse(
         generate(),
@@ -207,7 +227,39 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "kb_chunks": deps.kb.count()}
+        # model は環境変数を読むだけ（外部への問い合わせなし）。拡張がステータスバー
+        # の表示を更新するのに使うので、モデル一覧 API を叩かせずに済ませる
+        return {"status": "ok", "kb_chunks": deps.kb.count(), "model": current_model_name()}
+
+    @app.get("/models")
+    def models(refresh: bool = False):
+        """選べるモデルの一覧と現在のモデル。拡張の選択 UI とターミナルが使う。
+
+        source="api" なら Google の ListModels から取った実際に使える一覧、
+        "fallback" ならキー未設定・オフライン時の内蔵候補（古い可能性がある）。
+        """
+        entries, source = available_models(refresh=refresh)
+        return {
+            "current": current_model_name(),
+            "default": DEFAULT_MODEL,
+            "source": source,
+            "fake_llm": os.environ.get("QQQ_FAKE_LLM") == "1",
+            "models": entries,
+        }
+
+    @app.post("/models/select")
+    def select_model(request: SelectModelRequest):
+        """使うモデルを切り替える（再起動不要。次の生成から効く）。
+
+        進行中セッションの生成にもそのまま効く（GeminiLLM は呼び出しのたびに
+        現在のモデル名を読む）。永続化はしないので、次回起動時のモデルは
+        拡張の設定 qqquestion.model / QQQ_MODEL 側で決まる。
+        """
+        previous = current_model_name()
+        current = set_current_model(request.model)
+        if current != previous:
+            logger.info("使用モデルを切り替えました: %s -> %s", previous, current)
+        return {"current": current, "default": DEFAULT_MODEL, "previous": previous}
 
     @app.post("/quiz/start")
     def start(request: StartRequest):
@@ -269,9 +321,17 @@ def create_app(deps: AppDeps | None = None) -> FastAPI:
             "topics": diff_ctx.topics,
             "files": diff_ctx.files,
             "kb_chunks": deps.kb.count(),
+            # weak_topics は苦手の全一覧、priority_topics はそのうち今回の差分に
+            # 関係するもの（実際に優先出題されるのはこちらだけ）
             "weak_topics": learner_state.weak_topics(),
+            "priority_topics": learner_state.priority_topics(diff_ctx.topics),
+            "overcome_topics": learner_state.overcome_topics(),
+            "weak_topic_scores": learner_state.weak_topic_scores(),
             "total": session.total,
             "error": session.error,
+            # どのモデルで出題されたかを UI/ターミナルに出せるようにする。
+            # 一覧 API を叩かずに済むよう、開始応答に載せる
+            "model": current_model_name(),
         }
 
     @app.get("/quiz/pending")
@@ -439,7 +499,9 @@ def main() -> None:
 
     load_env_file()  # backend/.env から GOOGLE_API_KEY 等を読み込む（任意）
     log_path = setup_file_logging(Path(os.environ.get("QQQ_DATA_DIR", "data")))
-    logger.info("バックエンド起動: ログファイル=%s", log_path)
+    logger.info(
+        "バックエンド起動: ログファイル=%s モデル=%s", log_path, current_model_name()
+    )
     port = int(os.environ.get("QQQ_PORT", DEFAULT_PORT))
     # log_config=None: uvicorn 既定設定で propagate が切れてファイルに
     # アクセスログ・例外ログが届かなくなるのを防ぐ（logsetup.py 参照）

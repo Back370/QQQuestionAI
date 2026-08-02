@@ -1,5 +1,23 @@
-from qqquestion.judge import _SYSTEM, judge_answer
-from qqquestion.models import Judgement
+from qqquestion.judge import _SYSTEM, canonical_point, judge_answer
+from qqquestion.models import Judgement, Question
+
+# issue #17 の再現に使う、要点が言い換えられやすい問題
+_RETRY_QUESTION = Question(
+    id="retry",
+    type="implementation",
+    text="なぜエラー時に500ではなく200を返しているのですか。",
+    model_answer=(
+        "何度リトライしても結果が変わらない種類のエラーなので、200を返して"
+        "処理成功を伝え、呼び出し元のリトライを止めるため。"
+    ),
+    accepted_points=[
+        "リトライしても結果が変わらないエラーの性質",
+        "200を返して呼び出し元のリトライを止める",
+    ],
+    rubric="エラーの性質と、リトライを止める目的の両方に触れれば correct。",
+    topic="エラーハンドリング",
+    difficulty=2,
+)
 
 
 def test_system_prompt_forbids_verdict_in_reason():
@@ -16,6 +34,46 @@ def test_system_prompt_hides_missing_point_content_in_reason():
     assert "欠けている要点" in _SYSTEM
     assert "言い換えて述べることも" in _SYSTEM  # 言い換えでの漏洩も禁止
     assert "抽象的に" in _SYSTEM  # 方向だけ示す
+
+
+def test_system_prompt_limits_grading_to_what_the_question_asks():
+    # 問題文が聞いていない観点まで要点にされていても、それは学習者の失点に
+    # しない。出題側の不備で partial にされ続ける事故を防ぐ（Issue #29）
+    assert "採点の範囲" in _SYSTEM
+    assert "問題文がまったく求めていない要点" in _SYSTEM
+    assert "matched_points にも missing_points にも入れない" in _SYSTEM
+
+
+def test_out_of_scope_point_does_not_block_correct(fake_llm):
+    """問題文の求めに答えていれば、範囲外の要点が残っていても correct にする。
+
+    Issue #29 の報告例（「継続する条件」しか聞いていない問題に「終了する条件」の
+    要点が混ざっていた）。judge が範囲外の要点を採点から外して correct を返したら、
+    コード側の合算（_merge_with_previous）はそれを partial に落とさない。
+    """
+    question = Question(
+        id="q1",
+        type="prerequisite",
+        text="while 文で and を使った場合、ループが継続するのはどのような時ですか。",
+        model_answer="すべての条件が真のときに継続する。",
+        accepted_points=[
+            "すべての条件が真のとき継続する",
+            "いずれかの条件が偽になると終了する",  # 問題文が聞いていない範囲外の要点
+        ],
+        rubric="継続条件に触れていれば correct。",
+        topic="制御構文",
+    )
+    fake_llm.enqueue(
+        Judgement(
+            verdict="correct",
+            matched_points=["すべての条件が真のとき継続する"],
+            missing_points=[],
+            reason="継続条件を説明できています。",
+        )
+    )
+    judgement = judge_answer(fake_llm, question, "全ての条件が満たされている時")
+    assert judgement.verdict == "correct"
+    assert judgement.missing_points == []
 
 
 def test_exact_match_skips_llm(fake_llm, demo_questions):
@@ -106,6 +164,82 @@ def test_partial_accumulates_but_stays_partial(fake_llm, demo_questions):
     assert judgement.verdict == "partial"
     assert set(judgement.matched_points) == {"再帰結合", "前の時刻の隠れ状態"}
     assert judgement.missing_points == ["系列・文脈の保持"]
+
+
+def test_system_prompt_requires_verbatim_points():
+    # 要点を言い換えて返されると突き合わせが外れ、満たした要点が数えられない
+    # （issue #17 の温床）。コピーを求める指示の回帰ガード
+    assert "そのままコピー" in _SYSTEM
+
+
+def test_llm_correct_is_not_demoted_to_partial(fake_llm):
+    """LLM が correct と判定したものを合算で降格させない（issue #17）。
+
+    LLM が要点を言い換えて返すと accepted_points との対応が取れず、
+    「全要点に触れたのに部分的に正解」と表示されていた。
+    """
+    fake_llm.enqueue(
+        Judgement(
+            verdict="correct",
+            # accepted_points のどれとも文字列対応が取れない言い換え
+            matched_points=["前回の内容と合わせて必要な観点がすべて揃った"],
+            missing_points=[],
+            reason="必要な要素がすべて揃いました",
+        )
+    )
+    judgement = judge_answer(
+        fake_llm,
+        _RETRY_QUESTION,
+        "200を返して処理成功を伝えることでリトライを止めるため",
+        already_matched=["リトライしても結果が変わらないエラーの性質"],
+    )
+    assert judgement.verdict == "correct"
+    assert judgement.missing_points == []
+    assert set(judgement.matched_points) == set(_RETRY_QUESTION.accepted_points)
+
+
+def test_partial_with_shortened_point_is_promoted_to_correct(fake_llm):
+    """要点を短く言い換えられても、合算で全要点が埋まれば正解にする（issue #17）。"""
+    fake_llm.enqueue(
+        Judgement(
+            verdict="partial",
+            matched_points=["リトライを止めるため"],  # 要点の短い言い換え
+            missing_points=[],
+            reason="目的について捉えられています",
+        )
+    )
+    judgement = judge_answer(
+        fake_llm,
+        _RETRY_QUESTION,
+        "200を返して処理成功を伝えることでリトライを止めるため",
+        already_matched=["リトライしても結果が変わらないエラーの性質"],
+    )
+    assert judgement.verdict == "correct"
+    assert judgement.missing_points == []
+
+
+def test_canonical_point_matches_shortened_paraphrase():
+    accepted = _RETRY_QUESTION.accepted_points
+    assert canonical_point("リトライを止めるため", accepted) == accepted[1]
+    # 似ていない文字列は取り込まない（別の要点を満たしたと誤認しない）
+    assert canonical_point("ログを出力しているから", accepted) is None
+    # 短すぎる断片でのファジー一致もしない
+    assert canonical_point("200", accepted) is None
+
+
+def test_incorrect_stays_incorrect_with_already_matched(fake_llm):
+    """降格しないだけで、満たしていない解答が昇格するわけではない。"""
+    fake_llm.enqueue(
+        Judgement(verdict="incorrect", matched_points=[], reason="要点に届いていません")
+    )
+    judgement = judge_answer(
+        fake_llm,
+        _RETRY_QUESTION,
+        "なんとなくそう書いた",
+        already_matched=["リトライしても結果が変わらないエラーの性質"],
+    )
+    assert judgement.verdict == "partial"  # 前回分は保持したまま partial
+    assert judgement.missing_points == ["200を返して呼び出し元のリトライを止める"]
 
 
 def test_llm_paraphrased_points_are_canonicalized(fake_llm, demo_questions):

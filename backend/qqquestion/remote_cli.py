@@ -8,7 +8,9 @@ VSCode 拡張の利用者向け。拡張は API キーを VSCode の SecretStora
 
 コミットは一切行わない。git とは無関係にいつでも実行できる。
 
-    python -m qqquestion.remote_cli            # ステージ済み差分から出題
+    python -m qqquestion.remote_cli                    # ステージ済み差分から出題
+    python -m qqquestion.remote_cli --list-models      # 使えるモデルを一覧表示
+    python -m qqquestion.remote_cli --model gemini-...  # モデルを切り替えて出題
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import sys
 import time
 from typing import Iterator
 
+from .learner_model import format_learner_summary
 from .terminput import enable_line_editing
 
 DEFAULT_PORT = 8756
@@ -108,6 +111,9 @@ def _consume_stream(client, url: str, json_body: dict | None = None) -> dict | N
                 explanation.update(event.get("explanation", ""))
             elif name == "result":
                 result = event
+            elif name == "error":
+                # 生成がタイムアウト等で中断した。理由を出して先へ進ませる
+                print(f"\n[生成に失敗しました] {event.get('message', '')}")
     if explanation.started:
         print()
         citations = ((result or {}).get("explanation") or {}).get("citations") or []
@@ -136,6 +142,35 @@ def _print_verdict(payload: dict, streamed_reason: bool) -> None:
         print(f"\n正解は「{payload.get('model_answer')}」でした。")
     else:
         print("先生> 残念、違います。「ヒント」と言ってくれれば手がかりを出しますよ。")
+
+
+def print_models(client, port: int) -> None:
+    """バックエンドが把握しているモデル一覧を表示する（* が現在のモデル）。
+
+    一覧の取得には API キーが要るが、キーはバックエンド側にしか無いので
+    ここでも HTTP 越しに訊く（ターミナルに秘密を置かない方針）。
+    """
+    body = client.get(f"{_base_url(port)}/models", timeout=LLM_TIMEOUT).json()
+    if body.get("source") == "fallback":
+        print("（APIから一覧を取得できませんでした。内蔵の候補を表示します）")
+    for entry in body.get("models", []):
+        mark = "*" if entry["name"] == body.get("current") else " "
+        note = entry.get("description") or entry.get("label") or ""
+        print(f" {mark} {entry['name']}  {note}".rstrip())
+    print("\n切り替え: quiz --model <モデル名>（VSCode の設定 qqquestion.model でも変更可）")
+
+
+def select_model(client, port: int, model: str) -> str:
+    """バックエンドの使用モデルを切り替える（再起動不要）。
+
+    切り替えはバックエンドのプロセス全体に効くため、VSCode 側のクイズにも
+    同じモデルが使われる。次回起動時に戻したくない場合は設定 qqquestion.model を使う。
+    """
+    body = client.post(
+        f"{_base_url(port)}/models/select", json={"model": model}, timeout=TIMEOUT
+    )
+    body.raise_for_status()
+    return body.json()["current"]
 
 
 def _print_question(view: dict) -> None:
@@ -167,7 +202,7 @@ def _wait_for_question(client, port: int, sid: str) -> dict | None:
         time.sleep(1.0)
 
 
-def run(repo: str, port: int) -> int:
+def run(repo: str, port: int, model: str | None = None, list_models: bool = False) -> int:
     enable_line_editing()  # input() を日本語（マルチバイト）でも1文字ずつ削除できるようにする
     try:
         import httpx
@@ -187,6 +222,16 @@ def run(repo: str, port: int) -> int:
             )
             return 1
 
+        if list_models:
+            print_models(client, port)
+            return 0
+        if model:
+            try:
+                print(f"使用モデルを {select_model(client, port, model)} に切り替えました。")
+            except Exception as error:
+                print(f"モデルを切り替えられませんでした: {error}", file=sys.stderr)
+                return 1
+
         response = client.post(
             f"{_base_url(port)}/quiz/start",
             # origin="cli": 出題はこの端末で行う。拡張にパネルを開かせない
@@ -201,10 +246,17 @@ def run(repo: str, port: int) -> int:
         sid = body["session_id"]
 
         print(BANNER)
+        if body.get("model"):
+            print(f"使用モデル: {body['model']}（--model で切り替え / --list-models で一覧）")
         print(f"対象差分: {', '.join(body.get('files') or []) or '(不明)'}")
         print(f"抽出トピック: {' / '.join(body.get('topics') or []) or '(なし)'}")
-        if body.get("weak_topics"):
-            print(f"前回の苦手傾向: {' / '.join(body['weak_topics'])} → 優先出題します")
+        for line in format_learner_summary(
+            body.get("weak_topics") or [],
+            body.get("priority_topics") or [],
+            body.get("overcome_topics") or [],
+            body.get("weak_topic_scores") or {},
+        ):
+            print(line)
         if body.get("error"):
             print(f"\n警告: {body['error']}")
         print()
@@ -262,8 +314,16 @@ def main() -> None:
         default=int(os.environ.get("QQQ_PORT", DEFAULT_PORT)),
         help="バックエンドのポート",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="使用するモデルを切り替えてから出題する（バックエンド全体に効く）",
+    )
+    parser.add_argument(
+        "--list-models", action="store_true", help="使えるモデルを一覧表示して終了"
+    )
     args = parser.parse_args()
-    sys.exit(run(args.repo, args.port))
+    sys.exit(run(args.repo, args.port, args.model, args.list_models))
 
 
 if __name__ == "__main__":
