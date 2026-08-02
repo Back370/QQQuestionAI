@@ -185,5 +185,5 @@ ls "$HOME/Library/Application Support/Code/User/globalStorage/back-room.qqquesti
 ```
 
 生成に失敗したときのログは `QQQ_DATA_DIR/server.log`。
-`backend/` のソースから起動した場合は [data/server.log](data/server.log)、
+`backend/` のソースから起動した場合は `backend/data/server.log`、
 同梱ソースから起動した場合は上の globalStorage 配下の `data/server.log` にある。
