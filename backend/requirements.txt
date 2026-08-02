@@ -18,5 +18,5 @@ fastapi==0.140.0
 uvicorn==0.51.0
 pydantic==2.13.4
 httpx==0.28.1
-langchain-core==1.5.1
+langchain-core==1.5.2
 langchain-google-genai==4.2.7
