@@ -36,6 +36,46 @@ def test_system_prompt_hides_missing_point_content_in_reason():
     assert "抽象的に" in _SYSTEM  # 方向だけ示す
 
 
+def test_system_prompt_limits_grading_to_what_the_question_asks():
+    # 問題文が聞いていない観点まで要点にされていても、それは学習者の失点に
+    # しない。出題側の不備で partial にされ続ける事故を防ぐ（Issue #29）
+    assert "採点の範囲" in _SYSTEM
+    assert "問題文がまったく求めていない要点" in _SYSTEM
+    assert "matched_points にも missing_points にも入れない" in _SYSTEM
+
+
+def test_out_of_scope_point_does_not_block_correct(fake_llm):
+    """問題文の求めに答えていれば、範囲外の要点が残っていても correct にする。
+
+    Issue #29 の報告例（「継続する条件」しか聞いていない問題に「終了する条件」の
+    要点が混ざっていた）。judge が範囲外の要点を採点から外して correct を返したら、
+    コード側の合算（_merge_with_previous）はそれを partial に落とさない。
+    """
+    question = Question(
+        id="q1",
+        type="prerequisite",
+        text="while 文で and を使った場合、ループが継続するのはどのような時ですか。",
+        model_answer="すべての条件が真のときに継続する。",
+        accepted_points=[
+            "すべての条件が真のとき継続する",
+            "いずれかの条件が偽になると終了する",  # 問題文が聞いていない範囲外の要点
+        ],
+        rubric="継続条件に触れていれば correct。",
+        topic="制御構文",
+    )
+    fake_llm.enqueue(
+        Judgement(
+            verdict="correct",
+            matched_points=["すべての条件が真のとき継続する"],
+            missing_points=[],
+            reason="継続条件を説明できています。",
+        )
+    )
+    judgement = judge_answer(fake_llm, question, "全ての条件が満たされている時")
+    assert judgement.verdict == "correct"
+    assert judgement.missing_points == []
+
+
 def test_exact_match_skips_llm(fake_llm, demo_questions):
     question = demo_questions[0]
     judgement = judge_answer(fake_llm, question, question.model_answer)

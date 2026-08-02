@@ -203,6 +203,10 @@ def _assert_scope_rule(system: str) -> None:
     assert "その観点を問題文の側に明記する" in system
     # 観点を書かせる副作用で答えを漏らさせない
     assert "答えの内容" in system
+    # 要点ごとに「問題文のどの語句が求めているか」を確認させる（Issue #29 の
+    # 報告例: 「継続する条件」しか聞いていない問題に「終了する条件」の要点）
+    assert "問題文のどの語句が" in system
+    assert "指せない要点は削る" in system
 
 
 def test_scope_rule_in_batch_prompt(fake_llm, diff_ctx):
