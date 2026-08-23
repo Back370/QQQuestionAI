@@ -15,7 +15,7 @@
 # が要るが、Windows/macOS/Linux で解決結果が変わりうる構成なので採用していない。
 
 fastapi==0.141.1
-uvicorn==0.51.0
+uvicorn==0.52.4
 pydantic==2.13.4
 httpx==0.28.1
 langchain-core==1.5.2
